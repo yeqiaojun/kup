@@ -30,6 +30,7 @@ type Session struct {
 	closeOnce sync.Once
 	closed    chan struct{}
 	lastKCPAt atomic.Int64
+	recvBuf   []byte
 }
 
 type sessionEventKind uint8
@@ -132,8 +133,8 @@ func (s *Session) handleInbound(packet inboundPacket) {
 func (s *Session) loop() {
 	defer s.server.wg.Done()
 
-	ticker := time.NewTicker(s.server.config.UpdateInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(s.nextUpdateDelay())
+	defer timer.Stop()
 
 	closeErr := ErrSessionClosed
 
@@ -150,9 +151,10 @@ func (s *Session) loop() {
 			return
 		case closeErr = <-s.closeCh:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			s.kcp.Update()
 			s.drainKCP()
+			resetTimer(timer, s.nextUpdateDelay())
 		case event := <-s.events:
 			switch event.kind {
 			case sessionEventInbound:
@@ -163,16 +165,19 @@ func (s *Session) loop() {
 				case protocol.MsgTypeKCP:
 					if rc := s.kcp.Input(event.inbound.payload, kcp.IKCP_PACKET_REGULAR, s.server.config.KCP.AckNoDelay); rc == 0 {
 						s.markKCPActive(time.Now())
+						s.kcp.Update()
 						s.drainKCP()
 					}
 				}
 			case sessionEventSend:
 				if s.kcp.Send(event.payload) == 0 {
 					s.kcp.Update()
+					s.drainKCP()
 				}
 			case sessionEventDrain:
 				s.drainKCP()
 			}
+			resetTimer(timer, s.nextUpdateDelay())
 		}
 	}
 }
@@ -188,7 +193,8 @@ func (s *Session) drainKCP() {
 			return
 		}
 
-		buf := make([]byte, size)
+		buf := ensureScratch(s.recvBuf, size)
+		s.recvBuf = buf
 		n := s.kcp.Recv(buf)
 		if n < 0 {
 			return
@@ -230,6 +236,15 @@ func (s *Session) markKCPActive(now time.Time) {
 	s.lastKCPAt.Store(now.UnixNano())
 }
 
+func (s *Session) nextUpdateDelay() time.Duration {
+	next := s.kcp.Check()
+	now := uint32(time.Now().UnixMilli())
+	if next <= now {
+		return 0
+	}
+	return time.Duration(next-now) * time.Millisecond
+}
+
 type sessionTransport struct {
 	server *Server
 	sessID uint32
@@ -264,19 +279,21 @@ func (t *sessionTransport) writeKCP(payload []byte) {
 		return
 	}
 
-	header, err := (protocol.Header{
+	size := protocol.HeaderSize + len(payload)
+	packet := t.server.acquirePacketBuffer(size)
+	header := protocol.Header{
 		MsgType: protocol.MsgTypeKCP,
 		BodyLen: uint16(len(payload)),
 		SessID:  t.sessID,
-	}).MarshalBinary()
-	if err != nil {
+	}
+	if err := header.EncodeTo(packet[:protocol.HeaderSize]); err != nil {
+		t.server.releasePacketBuffer(packet)
 		return
 	}
 
-	packet := make([]byte, len(header)+len(payload))
-	copy(packet, header)
-	copy(packet[len(header):], payload)
+	copy(packet[protocol.HeaderSize:], payload)
 	_, _ = t.server.conn.WriteTo(packet, addr)
+	t.server.releasePacketBuffer(packet)
 }
 
 func newKCPState(server *Server, id uint32, transport *sessionTransport) *kcp.KCP {
@@ -292,4 +309,21 @@ func newKCPState(server *Server, id uint32, transport *sessionTransport) *kcp.KC
 	state.WndSize(server.config.KCP.SendWindow, server.config.KCP.RecvWindow)
 	state.SetMtu(server.config.KCP.MTU)
 	return state
+}
+
+func ensureScratch(buf []byte, size int) []byte {
+	if cap(buf) < size {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func resetTimer(timer *time.Timer, d time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
 }

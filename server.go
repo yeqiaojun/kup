@@ -32,12 +32,15 @@ type Server struct {
 	mu       sync.RWMutex
 	sessions map[uint32]*Session
 	pending  map[uint32]*pendingAuth
+
+	packetPool sync.Pool
 }
 
 type pendingAuth struct {
 	sessID    uint32
 	transport *sessionTransport
 	kcp       *kcp.KCP
+	recvBuf   []byte
 }
 
 func Listen(addr string, handler Handler, config Config) (*Server, error) {
@@ -96,6 +99,28 @@ func (s *Server) SendToSess(sessID uint32, payload []byte) error {
 
 func (s *Server) SendToMultiSess(sessIDs []uint32, payload []byte) SendReport {
 	report := SendReport{}
+	if len(sessIDs) <= 8 {
+		for i, sessID := range sessIDs {
+			duplicate := false
+			for j := 0; j < i; j++ {
+				if sessIDs[j] == sessID {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+			report.Attempted++
+			if err := s.SendToSess(sessID, payload); err != nil {
+				report.Failed++
+				continue
+			}
+			report.Sent++
+		}
+		return report
+	}
+
 	seen := make(map[uint32]struct{}, len(sessIDs))
 	for _, sessID := range sessIDs {
 		if _, exists := seen[sessID]; exists {
@@ -114,20 +139,15 @@ func (s *Server) SendToMultiSess(sessIDs []uint32, payload []byte) SendReport {
 
 func (s *Server) SendToAll(payload []byte) SendReport {
 	s.mu.RLock()
-	sessions := make([]*Session, 0, len(s.sessions))
+	report := SendReport{Attempted: len(s.sessions)}
 	for _, sess := range s.sessions {
-		sessions = append(sessions, sess)
-	}
-	s.mu.RUnlock()
-
-	report := SendReport{Attempted: len(sessions)}
-	for _, sess := range sessions {
 		if err := sess.Send(payload); err != nil {
 			report.Failed++
 			continue
 		}
 		report.Sent++
 	}
+	s.mu.RUnlock()
 	return report
 }
 
@@ -150,12 +170,12 @@ func (s *Server) readLoop() {
 		}
 
 		now := time.Now()
-		payload := append([]byte(nil), body...)
 		if sess := s.Session(header.SessID); sess != nil {
 			if !sameAddr(sess.RemoteAddr(), addr) {
 				if header.MsgType == protocol.MsgTypeKCP && header.Flags&protocol.FlagConnect != 0 {
-					s.handlePendingKCP(header.SessID, payload, addr)
+					s.handlePendingKCP(header.SessID, body, addr)
 				} else if header.MsgType == protocol.MsgTypeKCP && sess.withinFastReconnectWindow(now) {
+					payload := append([]byte(nil), body...)
 					sess.handleInbound(inboundPacket{
 						msgType:   header.MsgType,
 						packetSeq: header.PacketSeq,
@@ -166,6 +186,7 @@ func (s *Server) readLoop() {
 				continue
 			}
 
+			payload := append([]byte(nil), body...)
 			sess.handleInbound(inboundPacket{
 				msgType:   header.MsgType,
 				packetSeq: header.PacketSeq,
@@ -178,7 +199,7 @@ func (s *Server) readLoop() {
 		if header.MsgType == protocol.MsgTypeUDP {
 			continue
 		}
-		s.handlePendingKCP(header.SessID, payload, addr)
+		s.handlePendingKCP(header.SessID, body, addr)
 	}
 }
 
@@ -206,6 +227,7 @@ func (s *Server) handlePendingKCP(sessID uint32, payload []byte, addr net.Addr) 
 		s.removePending(sessID, pending)
 		return
 	}
+	pending.kcp.Update()
 
 	for {
 		size := pending.kcp.PeekSize()
@@ -213,7 +235,8 @@ func (s *Server) handlePendingKCP(sessID uint32, payload []byte, addr net.Addr) 
 			return
 		}
 
-		buf := make([]byte, size)
+		buf := ensureScratch(pending.recvBuf, size)
+		pending.recvBuf = buf
 		n := pending.kcp.Recv(buf)
 		if n < 0 {
 			return
@@ -277,4 +300,21 @@ func sameAddr(a, b net.Addr) bool {
 		return false
 	}
 	return a.String() == b.String()
+}
+
+func (s *Server) acquirePacketBuffer(size int) []byte {
+	if size <= s.config.PacketSize {
+		if buf, ok := s.packetPool.Get().([]byte); ok && cap(buf) >= size {
+			return buf[:size]
+		}
+		return make([]byte, size, s.config.PacketSize)
+	}
+	return make([]byte, size)
+}
+
+func (s *Server) releasePacketBuffer(buf []byte) {
+	if cap(buf) < s.config.PacketSize {
+		return
+	}
+	s.packetPool.Put(buf[:s.config.PacketSize])
 }

@@ -23,6 +23,7 @@ var (
 	ErrShortPacket        = errors.New("protocol: packet shorter than header")
 	ErrInvalidMsgType     = errors.New("protocol: invalid msg type")
 	ErrPayloadLenMismatch = errors.New("protocol: payload length mismatch")
+	ErrShortHeaderBuffer  = errors.New("protocol: header encode buffer too short")
 )
 
 type Header struct {
@@ -39,12 +40,26 @@ func (h Header) MarshalBinary() ([]byte, error) {
 	}
 
 	buf := make([]byte, HeaderSize)
-	buf[0] = byte(h.MsgType)
-	buf[1] = byte(h.Flags)
-	putUint16LE(buf[2:4], h.BodyLen)
-	putUint32LE(buf[4:8], h.SessID)
-	putUint32LE(buf[8:12], h.PacketSeq)
+	if err := h.EncodeTo(buf); err != nil {
+		return nil, err
+	}
 	return buf, nil
+}
+
+func (h Header) EncodeTo(dst []byte) error {
+	if !isValidMsgType(h.MsgType) {
+		return ErrInvalidMsgType
+	}
+	if len(dst) < HeaderSize {
+		return ErrShortHeaderBuffer
+	}
+
+	dst[0] = byte(h.MsgType)
+	dst[1] = byte(h.Flags)
+	putUint16LE(dst[2:4], h.BodyLen)
+	putUint32LE(dst[4:8], h.SessID)
+	putUint32LE(dst[8:12], h.PacketSeq)
+	return nil
 }
 
 func UnmarshalHeader(packet []byte) (Header, error) {
