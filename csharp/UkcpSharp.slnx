@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="UkcpSharp.Console/UkcpSharp.Console.csproj" />
+  <Project Path="UkcpSharp.Tests/UkcpSharp.Tests.csproj" />
+  <Project Path="UkcpSharp/UkcpSharp.csproj" />
+</Solution>

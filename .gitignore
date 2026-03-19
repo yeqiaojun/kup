@@ -1,0 +1,26 @@
+# C# / .NET build outputs
+**/[Bb]in/
+**/[Oo]bj/
+**/TestResults/
+**/[Dd]ebug/
+**/[Rr]elease/
+
+# NuGet restore artifacts
+**/project.assets.json
+**/project.nuget.cache
+**/*.nuget.dgspec.json
+**/*.nuget.g.props
+**/*.nuget.g.targets
+
+# Visual Studio / Rider local files
+.vs/
+**/*.user
+**/*.suo
+**/*.rsuser
+**/*.userprefs
+*.DotSettings.user
+
+# Test and coverage artifacts
+**/*.trx
+**/*.coverage
+**/*.coveragexml
