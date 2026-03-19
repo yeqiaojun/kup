@@ -1,18 +1,26 @@
 using System;
+using System.Threading;
 using kcp2k;
 
 namespace UkcpSharp
 {
+    public enum UkcpResumeResult
+    {
+        Resumed = 1,
+        Redialed = 2
+    }
+
     public sealed class UkcpClient
     {
         private readonly UkcpClientConfig _config;
-        private readonly Kcp _kcp;
         private readonly byte[] _receiveBuffer;
 
+        private Kcp _kcp;
         private IDatagramSocket _socket;
         private bool _connected;
         private bool _authStarted;
         private UkcpHeaderFlags _outputFlags;
+        private long _inboundKcpCount;
 
         public UkcpClient(UkcpClientConfig config)
         {
@@ -22,12 +30,9 @@ namespace UkcpSharp
                 throw new ArgumentOutOfRangeException(nameof(config), "SessId must be non-zero.");
             }
 
-            _socket = _config.CreateSocket();
             _receiveBuffer = new byte[_config.PacketBufferSize];
-            _kcp = new Kcp(_config.SessId, HandleKcpOutput);
-            _kcp.SetNoDelay(_config.NoDelay, _config.Interval, _config.Resend, _config.NoCongestion);
-            _kcp.SetWindowSize(_config.SendWindow, _config.ReceiveWindow);
-            _kcp.SetMtu(_config.Mtu);
+            _socket = _config.CreateSocket();
+            _kcp = CreateKcp();
         }
 
         public uint SessId { get { return _config.SessId; } }
@@ -47,6 +52,13 @@ namespace UkcpSharp
 
             _socket.Connect(_config.Host, _config.Port);
             _connected = true;
+        }
+
+        public void ConnectAndAuth(byte[] authPayload)
+        {
+            if (authPayload == null) throw new ArgumentNullException(nameof(authPayload));
+            Connect();
+            SendAuth(authPayload);
         }
 
         public void SendAuth(byte[] payload)
@@ -90,12 +102,46 @@ namespace UkcpSharp
         {
             EnsureConnected();
 
-            IDatagramSocket next = _config.CreateSocket();
-            next.Connect(_config.Host, _config.Port);
+            ReplaceSocket(closeCurrent: true);
+        }
 
-            IDatagramSocket current = _socket;
-            _socket = next;
-            current.Close();
+        public void Resume(byte[] resumePayload)
+        {
+            if (resumePayload == null) throw new ArgumentNullException(nameof(resumePayload));
+            Reconnect();
+            SendKcp(resumePayload);
+        }
+
+        public UkcpResumeResult ResumeOrRedial(byte[] authPayload, byte[] resumePayload, int timeoutMs = 3000, int pollIntervalMs = 5)
+        {
+            if (authPayload == null) throw new ArgumentNullException(nameof(authPayload));
+            if (resumePayload == null) throw new ArgumentNullException(nameof(resumePayload));
+
+            long beforeResume = _inboundKcpCount;
+            Resume(resumePayload);
+
+            if (timeoutMs < 0)
+            {
+                timeoutMs = 0;
+            }
+            if (pollIntervalMs <= 0)
+            {
+                pollIntervalMs = 1;
+            }
+
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                Poll();
+                if (_inboundKcpCount > beforeResume)
+                {
+                    return UkcpResumeResult.Resumed;
+                }
+                Thread.Sleep(pollIntervalMs);
+            }
+
+            HardRedial(authPayload);
+            return UkcpResumeResult.Redialed;
         }
 
         public void Poll()
@@ -119,6 +165,7 @@ namespace UkcpSharp
 
             _connected = false;
             _socket.Close();
+            _authStarted = false;
             if (Closed != null) Closed();
         }
 
@@ -133,6 +180,7 @@ namespace UkcpSharp
                     throw new InvalidOperationException("KCP send failed.");
                 }
 
+                _kcp.Flush();
                 _kcp.Update(NowMs());
             }
             finally
@@ -205,6 +253,7 @@ namespace UkcpSharp
                     return;
                 }
 
+                _inboundKcpCount++;
                 if (KcpMessage != null) KcpMessage(payload);
             }
         }
@@ -220,6 +269,37 @@ namespace UkcpSharp
         private static uint NowMs()
         {
             return unchecked((uint)Environment.TickCount64);
+        }
+
+        private void HardRedial(byte[] authPayload)
+        {
+            ReplaceSocket(closeCurrent: true);
+            _kcp = CreateKcp();
+            _authStarted = false;
+            _inboundKcpCount = 0;
+            SendAuth(authPayload);
+        }
+
+        private void ReplaceSocket(bool closeCurrent)
+        {
+            IDatagramSocket next = _config.CreateSocket();
+            next.Connect(_config.Host, _config.Port);
+
+            IDatagramSocket current = _socket;
+            _socket = next;
+            if (closeCurrent)
+            {
+                current.Close();
+            }
+        }
+
+        private Kcp CreateKcp()
+        {
+            var kcp = new Kcp(_config.SessId, HandleKcpOutput);
+            kcp.SetNoDelay(_config.NoDelay, _config.Interval, _config.Resend, _config.NoCongestion);
+            kcp.SetWindowSize(_config.SendWindow, _config.ReceiveWindow);
+            kcp.SetMtu(_config.Mtu);
+            return kcp;
         }
     }
 }

@@ -27,8 +27,7 @@ client.Closed += () =>
     Console.WriteLine("closed");
 };
 
-client.Connect();
-client.SendAuth(Encoding.UTF8.GetBytes("auth"));
+client.ConnectAndAuth(Encoding.UTF8.GetBytes("auth"));
 
 Warmup(client, options.AuthWaitMs);
 
