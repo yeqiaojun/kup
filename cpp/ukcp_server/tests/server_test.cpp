@@ -282,6 +282,98 @@ UKCP_TEST(Server_AuthPacketIncrementsRecvStats) {
         server.Close();
 }
 
+UKCP_TEST(Server_SetMtuAppliesToFutureSessionsOnly) {
+        RecordingHandler handler;
+        Config config{};
+        config.kcp.mtu = 1300;
+        handler.expected_sess_id = 1020;
+
+        Server server("127.0.0.1:39120", handler, config);
+        UKCP_REQUIRE(server.Start());
+
+        TestKcpClient client1("127.0.0.1:39120", 1020);
+        client1.SendAuth("auth");
+        WaitUntil([&] { return handler.open_count.load() == 1; }, std::chrono::milliseconds(2000), "first auth did not open session");
+        Session *session1 = server.FindSession(1020);
+        UKCP_REQUIRE(session1 != nullptr);
+
+        const auto first_expected_mtu = config.kcp.mtu - static_cast<int>(ukcp::Header::kSize);
+        {
+                std::shared_lock lock(session1->raw_impl()->mutex);
+                UKCP_REQUIRE(session1->raw_impl()->kcp != nullptr);
+                UKCP_REQUIRE(static_cast<int>(session1->raw_impl()->kcp->mtu) == first_expected_mtu);
+        }
+
+        UKCP_REQUIRE(server.SetMtu(1500));
+
+        handler.expected_sess_id = 1021;
+        TestKcpClient client2("127.0.0.1:39120", 1021);
+        client2.SendAuth("auth");
+        WaitUntil([&] { return handler.open_count.load() == 2; }, std::chrono::milliseconds(2000), "second auth did not open session");
+        Session *session2 = server.FindSession(1021);
+        UKCP_REQUIRE(session2 != nullptr);
+
+        {
+                std::shared_lock lock(session1->raw_impl()->mutex);
+                UKCP_REQUIRE(static_cast<int>(session1->raw_impl()->kcp->mtu) == first_expected_mtu);
+        }
+        {
+                std::shared_lock lock(session2->raw_impl()->mutex);
+                UKCP_REQUIRE(session2->raw_impl()->kcp != nullptr);
+                UKCP_REQUIRE(static_cast<int>(session2->raw_impl()->kcp->mtu) == 1500 - static_cast<int>(ukcp::Header::kSize));
+        }
+
+        server.Close();
+}
+
+UKCP_TEST(Server_DefaultMtuIs1024MinusHeaderForKcp) {
+        RecordingHandler handler;
+        handler.expected_sess_id = 1022;
+
+        Server server("127.0.0.1:39122", handler, Config{});
+        UKCP_REQUIRE(server.Start());
+
+        TestKcpClient client("127.0.0.1:39122", 1022);
+        client.SendAuth("auth");
+        WaitUntil([&] { return handler.open_count.load() == 1; }, std::chrono::milliseconds(2000), "auth did not open session");
+
+        Session *session = server.FindSession(1022);
+        UKCP_REQUIRE(session != nullptr);
+        {
+                std::shared_lock lock(session->raw_impl()->mutex);
+                UKCP_REQUIRE(session->raw_impl()->kcp != nullptr);
+                UKCP_REQUIRE(static_cast<int>(session->raw_impl()->kcp->mtu) == 1024 - static_cast<int>(ukcp::Header::kSize));
+        }
+
+        server.Close();
+}
+
+UKCP_TEST(Server_SendKcpRejectsPayloadAboveKcpLimit) {
+        RecordingHandler handler;
+        handler.expected_sess_id = 1023;
+
+        Server server("127.0.0.1:39123", handler, Config{});
+        UKCP_REQUIRE(server.Start());
+
+        TestKcpClient client("127.0.0.1:39123", 1023);
+        client.SendAuth("auth");
+        WaitUntil([&] { return handler.open_count.load() == 1; }, std::chrono::milliseconds(2000), "auth did not open session");
+
+        Session *session = server.FindSession(1023);
+        UKCP_REQUIRE(session != nullptr);
+
+        std::size_t max_payload = 0;
+        {
+                std::shared_lock lock(session->raw_impl()->mutex);
+                UKCP_REQUIRE(session->raw_impl()->kcp != nullptr);
+                max_payload = ukcp::MaxKcpPayloadSize(*session->raw_impl()->kcp);
+        }
+
+        std::vector<std::uint8_t> payload(max_payload + 1, static_cast<std::uint8_t>('x'));
+        UKCP_REQUIRE(!session->SendKcp(payload));
+        server.Close();
+}
+
 #if !UKCP_ENABLE_STATS
 UKCP_TEST(Server_StatsReturnZeroWhenDisabled) {
         RecordingHandler handler;

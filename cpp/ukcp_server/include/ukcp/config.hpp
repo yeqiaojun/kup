@@ -6,7 +6,8 @@
 namespace ukcp {
 
 struct KcpConfig {
-        int mtu{1200};
+        // Transport MTU including the ukcp packet header.
+        int mtu{1024};
         int no_delay{1};
         int interval{10};
         int resend{2};

@@ -6,6 +6,10 @@ namespace ukcp {
 
 namespace {
 
+constexpr int kMinKcpMtu = 50;
+
+int KcpMtuFromTransportMtu(int mtu) { return mtu - static_cast<int>(Header::kSize); }
+
 std::string CloseReasonOrDefault(const std::string &reason) { return reason.empty() ? std::string("session closed") : reason; }
 
 std::vector<std::uint8_t> &WrappedPacketBuffer(std::size_t size) {
@@ -62,6 +66,7 @@ bool Session::SendKcp(std::span<const std::uint8_t> payload) {
                 std::unique_lock lock(impl_->mutex);
                 if (impl_->closed || impl_->kcp == nullptr) { return false; }
                 if (impl_->remote.valid() == false) { return false; }
+                if (payload.size() > MaxKcpPayloadSize(*impl_->kcp)) { return false; }
 
                 if (ikcp_send(impl_->kcp, reinterpret_cast<const char *>(payload.data()), static_cast<int>(payload.size())) < 0) { return false; }
         }
@@ -122,7 +127,9 @@ int PendingOutput(const char *buf, int len, ikcpcb *, void *user) {
 void ConfigureKcp(ikcpcb &kcp, const Config &config) {
         ikcp_nodelay(&kcp, config.kcp.no_delay, config.kcp.interval, config.kcp.resend, config.kcp.no_congestion);
         ikcp_wndsize(&kcp, config.kcp.send_window, config.kcp.recv_window);
-        ikcp_setmtu(&kcp, config.kcp.mtu);
+        const int kcp_mtu = KcpMtuFromTransportMtu(config.kcp.mtu);
+        if (kcp_mtu < kMinKcpMtu) { return; }
+        ikcp_setmtu(&kcp, kcp_mtu);
 }
 
 std::vector<std::vector<std::uint8_t>> DrainKcpMessages(ikcpcb &kcp, std::vector<std::uint8_t> &scratch) {

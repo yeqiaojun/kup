@@ -24,6 +24,9 @@ namespace ukcp {
 #define UKCP_ENABLE_STATS 0
 #endif
 
+// Vendored ikcp_send rejects fragmented messages with count >= IKCP_WND_RCV.
+constexpr std::size_t kMaxKcpMessageFragments = 127;
+
 struct SessionImpl {
         ServerImpl *server{nullptr};
         Session *public_session{nullptr};
@@ -146,6 +149,11 @@ inline void RecordSentUdpStats(ServerImpl &impl, std::size_t bytes) {
         (void)impl;
         (void)bytes;
 #endif
+}
+
+inline std::size_t MaxKcpPayloadSize(const ikcpcb &kcp) {
+        if (kcp.mss == 0) { return 0; }
+        return static_cast<std::size_t>(kcp.mss) * kMaxKcpMessageFragments;
 }
 
 } // namespace ukcp

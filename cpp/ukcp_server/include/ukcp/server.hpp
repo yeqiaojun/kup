@@ -36,6 +36,7 @@ class Server {
 
         bool Start();
         void Close();
+        bool SetMtu(int mtu);
 
         [[nodiscard]] bool IsRunning() const noexcept;
         [[nodiscard]] Session *FindSession(std::uint32_t sess_id);
