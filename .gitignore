@@ -24,3 +24,13 @@
 **/*.trx
 **/*.coverage
 **/*.coveragexml
+
+# Test / benchmark output files (Go and C++)
+*.out
+*.time
+gmon.out
+
+# C++ build and IDE output directories
+cpp/ukcp_server/build/
+cpp/ukcp_server/build-*/
+cpp/ukcp_server/out/
