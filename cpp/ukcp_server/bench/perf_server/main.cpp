@@ -201,7 +201,7 @@ int RunFixedMode(const Config &cfg, ukcp::Server &server, PerfHandler &handler) 
                 SleepUntil(next_due);
                 if (std::chrono::steady_clock::now() >= deadline) { break; }
                 WriteUint32LE(payload.data() + 1, ++tick);
-                server.SendToAll(payload);
+                server.SendKcpToAll(payload);
                 next_due += interval;
         }
 
@@ -252,9 +252,8 @@ int RunRoomMode(const Config &cfg, ukcp::Server &server, PerfHandler &handler) {
                                 const auto &members = rooms[room_index];
                                 WriteUint32LE(payload.data() + 1, tick_rounds);
                                 if (payload.size() >= 9) { WriteUint32LE(payload.data() + 5, members.front() / static_cast<std::uint32_t>(cfg.room_size)); }
-                                const auto report = server.SendToMultiSess(members, payload);
                                 ++room_frames;
-                                downlink_packets += static_cast<std::uint64_t>(report.sent);
+                                if (server.SendKcpToMultiSess(members, payload)) { downlink_packets += static_cast<std::uint64_t>(members.size()); }
                         }
                         next_due += sub_interval;
                 }

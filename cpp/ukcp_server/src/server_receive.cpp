@@ -204,13 +204,7 @@ void HandleKcpOnSession(ServerImpl &impl, Session &session, const Endpoint &endp
 
 bool DecodePacket(ServerImpl &impl, std::span<const std::uint8_t> packet, Header &header, std::span<const std::uint8_t> &body) {
         if (!Header::SplitPacket(packet, header, body)) { return false; }
-        impl.recv_packets.fetch_add(1, std::memory_order_relaxed);
-        impl.recv_bytes.fetch_add(packet.size(), std::memory_order_relaxed);
-        if (header.msg_type == MsgType::Kcp) {
-                impl.recv_kcp_packets.fetch_add(1, std::memory_order_relaxed);
-        } else if (header.msg_type == MsgType::Udp) {
-                impl.recv_udp_packets.fetch_add(1, std::memory_order_relaxed);
-        }
+        RecordRecvStats(impl, header.msg_type, packet.size());
         return true;
 }
 

@@ -55,7 +55,7 @@ SessionImpl *Session::raw_impl() noexcept { return impl_.get(); }
 
 const SessionImpl *Session::raw_impl() const noexcept { return impl_.get(); }
 
-bool Session::Send(std::span<const std::uint8_t> payload) {
+bool Session::SendKcp(std::span<const std::uint8_t> payload) {
         if (!impl_) { return false; }
 
         {
@@ -70,7 +70,7 @@ bool Session::Send(std::span<const std::uint8_t> payload) {
         return true;
 }
 
-bool Session::SendRawUdp(std::uint32_t packet_seq, std::span<const std::uint8_t> payload) {
+bool Session::SendUdp(std::uint32_t packet_seq, std::span<const std::uint8_t> payload) {
         if (!impl_) { return false; }
 
         bool sent = false;
@@ -82,9 +82,7 @@ bool Session::SendRawUdp(std::uint32_t packet_seq, std::span<const std::uint8_t>
         }
 
         if (sent) {
-                impl_->server->sent_packets.fetch_add(1, std::memory_order_relaxed);
-                impl_->server->sent_udp_packets.fetch_add(1, std::memory_order_relaxed);
-                impl_->server->sent_bytes.fetch_add(Header::kSize + static_cast<std::uint64_t>(payload.size()), std::memory_order_relaxed);
+                RecordSentUdpStats(*impl_->server, payload.size());
         }
         return sent;
 }
@@ -109,11 +107,7 @@ int SessionOutput(const char *buf, int len, ikcpcb *, void *user) {
                                                   std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(buf), static_cast<std::size_t>(len)))
                         : SendWrappedKcp(impl->server->socket_fd, impl->remote, impl->sess_id, HeaderFlags::None,
                                          std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(buf), static_cast<std::size_t>(len)));
-        if (sent) {
-                impl->server->sent_packets.fetch_add(1, std::memory_order_relaxed);
-                impl->server->sent_kcp_packets.fetch_add(1, std::memory_order_relaxed);
-                impl->server->sent_bytes.fetch_add(Header::kSize + static_cast<std::uint64_t>(len), std::memory_order_relaxed);
-        }
+        if (sent) { RecordSentKcpStats(*impl->server, static_cast<std::size_t>(len)); }
         return 0;
 }
 

@@ -14,12 +14,6 @@ class Handler;
 class Session;
 struct ServerImpl;
 
-struct SendReport {
-        int attempted{0};
-        int sent{0};
-        int failed{0};
-};
-
 struct ServerStatsSnapshot {
         std::uint64_t recv_packets{0};
         std::uint64_t recv_bytes{0};
@@ -47,12 +41,12 @@ class Server {
         [[nodiscard]] Session *FindSession(std::uint32_t sess_id);
         [[nodiscard]] ServerStatsSnapshot Stats() const;
 
-        bool SendToSess(std::uint32_t sess_id, std::span<const std::uint8_t> payload);
-        SendReport SendToMultiSess(const std::vector<std::uint32_t> &sess_ids, std::span<const std::uint8_t> payload);
-        SendReport SendToAll(std::span<const std::uint8_t> payload);
-        bool SendRawUdpToSess(std::uint32_t sess_id, std::uint32_t packet_seq, std::span<const std::uint8_t> payload);
-        SendReport SendRawUdpToMultiSess(const std::vector<std::uint32_t> &sess_ids, std::uint32_t packet_seq, std::span<const std::uint8_t> payload);
-        SendReport SendRawUdpToAll(std::uint32_t packet_seq, std::span<const std::uint8_t> payload);
+        bool SendKcpToSess(std::uint32_t sess_id, std::span<const std::uint8_t> payload);
+        bool SendKcpToMultiSess(const std::vector<std::uint32_t> &sess_ids, std::span<const std::uint8_t> payload);
+        bool SendKcpToAll(std::span<const std::uint8_t> payload);
+        bool SendUdpToSess(std::uint32_t sess_id, std::uint32_t packet_seq, std::span<const std::uint8_t> payload);
+        bool SendUdpToMultiSess(const std::vector<std::uint32_t> &sess_ids, std::uint32_t packet_seq, std::span<const std::uint8_t> payload);
+        bool SendUdpToAll(std::uint32_t packet_seq, std::span<const std::uint8_t> payload);
 
       private:
         std::unique_ptr<ServerImpl> impl_;

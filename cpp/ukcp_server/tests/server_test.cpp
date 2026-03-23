@@ -1,6 +1,10 @@
 #include "test_support.hpp"
 #include "server_internal.hpp"
 
+#ifndef UKCP_ENABLE_STATS
+#define UKCP_ENABLE_STATS 0
+#endif
+
 using ukcp::Config;
 using ukcp::Handler;
 using ukcp::HeaderFlags;
@@ -21,12 +25,12 @@ class EchoStatsHandler final : public Handler {
 
         void OnUDP(Session &session, std::uint32_t, std::span<const std::uint8_t> payload) override {
                 ++udp_count;
-                session.Send(payload);
+                session.SendKcp(payload);
         }
 
         void OnKCP(Session &session, std::span<const std::uint8_t> payload) override {
                 ++kcp_count;
-                session.Send(payload);
+                session.SendKcp(payload);
         }
 
         std::atomic<int> udp_count{0};
@@ -41,12 +45,24 @@ class RawUdpPushHandler final : public Handler {
 
         void OnKCP(Session &session, std::span<const std::uint8_t> payload) override {
                 ++kcp_count;
-                raw_udp_sent = session.SendRawUdp(88, payload);
+                raw_udp_sent = session.SendUdp(88, payload);
         }
 
         std::atomic<int> kcp_count{0};
         std::atomic<bool> raw_udp_sent{false};
 };
+
+void RequireZeroStats(const ukcp::ServerStatsSnapshot &stats) {
+        UKCP_REQUIRE(stats.recv_packets == 0);
+        UKCP_REQUIRE(stats.recv_bytes == 0);
+        UKCP_REQUIRE(stats.recv_kcp_packets == 0);
+        UKCP_REQUIRE(stats.recv_udp_packets == 0);
+        UKCP_REQUIRE(stats.sent_packets == 0);
+        UKCP_REQUIRE(stats.sent_bytes == 0);
+        UKCP_REQUIRE(stats.sent_kcp_packets == 0);
+        UKCP_REQUIRE(stats.sent_udp_packets == 0);
+        UKCP_REQUIRE(stats.active_sessions == 0);
+}
 
 } // namespace
 
@@ -257,9 +273,35 @@ UKCP_TEST(Server_AuthPacketIncrementsRecvStats) {
         TestKcpClient client("127.0.0.1:39116", 1016);
         client.SendAuth("auth");
 
+#if UKCP_ENABLE_STATS
         WaitUntil([&] { return server.Stats().recv_packets >= 1; }, std::chrono::milliseconds(2000), "server did not drain auth packet from listener");
+#else
+        WaitUntil([&] { return handler.open_count.load() == 1; }, std::chrono::milliseconds(2000), "auth did not open session");
+        RequireZeroStats(server.Stats());
+#endif
         server.Close();
 }
+
+#if !UKCP_ENABLE_STATS
+UKCP_TEST(Server_StatsReturnZeroWhenDisabled) {
+        RecordingHandler handler;
+        handler.expected_sess_id = 1017;
+        Server server("127.0.0.1:39117", handler, Config{});
+        UKCP_REQUIRE(server.Start());
+
+        TestKcpClient client("127.0.0.1:39117", 1017);
+        client.SendAuth("auth");
+        WaitUntil([&] { return handler.open_count.load() == 1; }, std::chrono::milliseconds(2000), "auth did not open session");
+
+        client.SendKcp("kcp");
+        client.SendUdp(19, "udp", 1);
+        WaitUntil([&] { return handler.kcp_count.load() == 1 && handler.udp_count.load() == 1; }, std::chrono::milliseconds(2000),
+                  "handler did not receive expected packets");
+
+        RequireZeroStats(server.Stats());
+        server.Close();
+}
+#endif
 
 UKCP_TEST(Server_FastReconnectKeepsSessionOpen) {
         RecordingHandler handler;
@@ -296,6 +338,7 @@ UKCP_TEST(Server_StatsTrackIngressAndSessions) {
         WaitUntil([&] { return handler.kcp_count.load() == 1 && handler.udp_count.load() == 3; }, std::chrono::milliseconds(2000),
                   "echo handler did not receive expected ingress packets");
 
+#if UKCP_ENABLE_STATS
         WaitUntil([&] { return server.Stats().sent_kcp_packets >= 4; }, std::chrono::milliseconds(2000),
                   "server stats did not observe expected outbound kcp packets");
 
@@ -306,6 +349,9 @@ UKCP_TEST(Server_StatsTrackIngressAndSessions) {
         UKCP_REQUIRE(stats.recv_udp_packets == 3);
         UKCP_REQUIRE(stats.sent_kcp_packets >= 4);
         UKCP_REQUIRE(stats.sent_packets == stats.sent_kcp_packets);
+#else
+        RequireZeroStats(server.Stats());
+#endif
         server.Close();
 }
 
@@ -319,8 +365,7 @@ UKCP_TEST(Server_SendFlushesWithoutWaitingForGlobalSweep) {
 
         TestKcpClient client("127.0.0.1:39109", 1009);
         client.SendAuth("auth");
-        WaitUntil([&] { return handler.kcp_count.load() == 0 && server.Stats().active_sessions == 1; }, std::chrono::milliseconds(2000),
-                  "auth did not open session");
+        WaitUntil([&] { return server.FindSession(1009) != nullptr; }, std::chrono::milliseconds(2000), "auth did not open session");
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         client.Poll(std::chrono::milliseconds(20));
 
@@ -330,7 +375,11 @@ UKCP_TEST(Server_SendFlushesWithoutWaitingForGlobalSweep) {
         const std::string echoed = client.WaitForKcp(std::chrono::milliseconds(150));
         const auto elapsed = std::chrono::steady_clock::now() - start;
 
+#if UKCP_ENABLE_STATS
         UKCP_REQUIRE(server.Stats().sent_kcp_packets > sent_before);
+#else
+        RequireZeroStats(server.Stats());
+#endif
         UKCP_REQUIRE(echoed == "echo-now");
         UKCP_REQUIRE(elapsed < std::chrono::milliseconds(150));
         server.Close();
@@ -364,10 +413,45 @@ UKCP_TEST(Server_CanSendRawUdpToSess) {
         client.SendAuth("auth");
         WaitUntil([&] { return handler.open_count.load() == 1; }, std::chrono::milliseconds(2000), "auth did not open session");
 
-        UKCP_REQUIRE(server.SendRawUdpToSess(1012, 99, Bytes("server-raw-udp")));
+        UKCP_REQUIRE(server.SendUdpToSess(1012, 99, Bytes("server-raw-udp")));
         const auto udp = client.WaitForUdp(std::chrono::milliseconds(2000));
         UKCP_REQUIRE(udp.packet_seq == 99);
         UKCP_REQUIRE(udp.payload == "server-raw-udp");
+#if UKCP_ENABLE_STATS
         WaitUntil([&] { return server.Stats().sent_udp_packets >= 1; }, std::chrono::milliseconds(2000), "server stats did not observe raw udp send");
+#else
+        RequireZeroStats(server.Stats());
+#endif
+        server.Close();
+}
+
+UKCP_TEST(Server_SendToAllReturnsTrueWhenAllSessionsSend) {
+        RecordingHandler handler;
+        handler.expected_sess_id = 1018;
+        Server server("127.0.0.1:39118", handler, Config{});
+        UKCP_REQUIRE(server.Start());
+
+        TestKcpClient client("127.0.0.1:39118", 1018);
+        client.SendAuth("auth");
+        WaitUntil([&] { return handler.open_count.load() == 1; }, std::chrono::milliseconds(2000), "auth did not open session");
+
+        UKCP_REQUIRE(server.SendKcpToAll(Bytes("server-push")));
+        UKCP_REQUIRE(client.WaitForKcp(std::chrono::milliseconds(2000)) == "server-push");
+        server.Close();
+}
+
+UKCP_TEST(Server_SendToMultiSessReturnsFalseWhenAnySessionMissing) {
+        RecordingHandler handler;
+        handler.expected_sess_id = 1019;
+        Server server("127.0.0.1:39119", handler, Config{});
+        UKCP_REQUIRE(server.Start());
+
+        TestKcpClient client("127.0.0.1:39119", 1019);
+        client.SendAuth("auth");
+        WaitUntil([&] { return handler.open_count.load() == 1; }, std::chrono::milliseconds(2000), "auth did not open session");
+
+        const std::vector<std::uint32_t> sess_ids{1019, 999999};
+        UKCP_REQUIRE(!server.SendKcpToMultiSess(sess_ids, Bytes("partial-push")));
+        UKCP_REQUIRE(client.WaitForKcp(std::chrono::milliseconds(2000)) == "partial-push");
         server.Close();
 }

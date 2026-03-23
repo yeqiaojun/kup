@@ -198,6 +198,7 @@ ServerStatsSnapshot Server::Stats() const {
         ServerStatsSnapshot snapshot{};
         if (!impl_) { return snapshot; }
 
+#if UKCP_ENABLE_STATS
         snapshot.recv_packets = impl_->recv_packets.load(std::memory_order_relaxed);
         snapshot.recv_bytes = impl_->recv_bytes.load(std::memory_order_relaxed);
         snapshot.recv_kcp_packets = impl_->recv_kcp_packets.load(std::memory_order_relaxed);
@@ -210,6 +211,7 @@ ServerStatsSnapshot Server::Stats() const {
                 std::shared_lock lock(impl_->mutex);
                 snapshot.active_sessions = static_cast<std::uint32_t>(impl_->sessions.size());
         }
+#endif
         return snapshot;
 }
 

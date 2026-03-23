@@ -131,11 +131,11 @@ class EchoHandler final : public ukcp::Handler {
                 return std::string(payload.begin(), payload.end()) == "auth";
         }
 
-        void OnUDP(ukcp::Session &session, std::uint32_t, std::span<const std::uint8_t> payload) override { session.Send(payload); }
+        void OnUDP(ukcp::Session &session, std::uint32_t, std::span<const std::uint8_t> payload) override { session.SendKcp(payload); }
 
         void OnKCP(ukcp::Session &session, std::span<const std::uint8_t> payload) override {
                 if (!payload.empty() && payload[0] == static_cast<std::uint8_t>('B')) { return; }
-                session.Send(payload);
+                session.SendKcp(payload);
         }
 };
 
@@ -595,7 +595,7 @@ int RunFixedRateScenario(const BenchConfig &config) {
                         }
                         const std::uint32_t tick = static_cast<std::uint32_t>(server_ticks.fetch_add(1, std::memory_order_relaxed) + 1);
                         WriteUint32LE(payload.data() + 1, tick);
-                        server.SendToAll(payload);
+                        server.SendKcpToAll(payload);
                         next_due += downlink_interval;
                 }
         });
@@ -680,9 +680,8 @@ int main(int argc, char **argv) {
                 broadcast_payload[0] = static_cast<std::uint8_t>('B');
                 for (int i = 0; i < config.broadcast_count; ++i) {
                         WriteUint32LE(broadcast_payload.data() + 1, static_cast<std::uint32_t>(i));
-                        const auto report = server.SendToAll(broadcast_payload);
-                        if (report.failed != 0) {
-                                std::cerr << "broadcast send failed: failed=" << report.failed << '\n';
+                        if (!server.SendKcpToAll(broadcast_payload)) {
+                                std::cerr << "broadcast send failed\n";
                                 return 1;
                         }
                 }

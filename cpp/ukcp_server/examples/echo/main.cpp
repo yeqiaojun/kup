@@ -24,13 +24,13 @@ class EchoHandler final : public ukcp::Handler {
         void OnUDP(ukcp::Session &session, std::uint32_t packet_seq, std::span<const std::uint8_t> payload) override {
                 std::string text(payload.begin(), payload.end());
                 std::cout << "udp sess=" << session.id() << " seq=" << packet_seq << " payload=" << text << '\n';
-                session.Send(payload);
+                session.SendKcp(payload);
         }
 
         void OnKCP(ukcp::Session &session, std::span<const std::uint8_t> payload) override {
                 std::string text(payload.begin(), payload.end());
                 std::cout << "kcp sess=" << session.id() << " payload=" << text << '\n';
-                session.Send(payload);
+                session.SendKcp(payload);
         }
 
         void OnSessionClose(ukcp::Session &session, const std::string &reason) override {

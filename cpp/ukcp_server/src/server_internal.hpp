@@ -20,6 +20,10 @@
 
 namespace ukcp {
 
+#ifndef UKCP_ENABLE_STATS
+#define UKCP_ENABLE_STATS 0
+#endif
+
 struct SessionImpl {
         ServerImpl *server{nullptr};
         Session *public_session{nullptr};
@@ -59,6 +63,7 @@ struct ServerImpl {
         std::unordered_map<std::uint32_t, PendingAuth> pending;
         std::unordered_map<SocketHandle, std::uint32_t> session_sockets;
 
+#if UKCP_ENABLE_STATS
         std::atomic<std::uint64_t> recv_packets{0};
         std::atomic<std::uint64_t> recv_bytes{0};
         std::atomic<std::uint64_t> recv_kcp_packets{0};
@@ -67,6 +72,7 @@ struct ServerImpl {
         std::atomic<std::uint64_t> sent_bytes{0};
         std::atomic<std::uint64_t> sent_kcp_packets{0};
         std::atomic<std::uint64_t> sent_udp_packets{0};
+#endif
         std::uint64_t scheduler_interval_ms{10};
 
         std::vector<std::uint8_t> read_buffer;
@@ -103,5 +109,43 @@ bool SendWrappedConnectedUdp(SocketHandle socket_fd, std::uint32_t sess_id, std:
 bool SameEndpoint(const Endpoint &a, const Endpoint &b) noexcept;
 
 void ScheduleSessionUpdate(ServerImpl &impl, Session &session, std::uint64_t due_ms);
+
+inline void RecordRecvStats(ServerImpl &impl, MsgType msg_type, std::size_t bytes) {
+#if UKCP_ENABLE_STATS
+        impl.recv_packets.fetch_add(1, std::memory_order_relaxed);
+        impl.recv_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (msg_type == MsgType::Kcp) {
+                impl.recv_kcp_packets.fetch_add(1, std::memory_order_relaxed);
+        } else if (msg_type == MsgType::Udp) {
+                impl.recv_udp_packets.fetch_add(1, std::memory_order_relaxed);
+        }
+#else
+        (void)impl;
+        (void)msg_type;
+        (void)bytes;
+#endif
+}
+
+inline void RecordSentKcpStats(ServerImpl &impl, std::size_t bytes) {
+#if UKCP_ENABLE_STATS
+        impl.sent_packets.fetch_add(1, std::memory_order_relaxed);
+        impl.sent_kcp_packets.fetch_add(1, std::memory_order_relaxed);
+        impl.sent_bytes.fetch_add(Header::kSize + static_cast<std::uint64_t>(bytes), std::memory_order_relaxed);
+#else
+        (void)impl;
+        (void)bytes;
+#endif
+}
+
+inline void RecordSentUdpStats(ServerImpl &impl, std::size_t bytes) {
+#if UKCP_ENABLE_STATS
+        impl.sent_packets.fetch_add(1, std::memory_order_relaxed);
+        impl.sent_udp_packets.fetch_add(1, std::memory_order_relaxed);
+        impl.sent_bytes.fetch_add(Header::kSize + static_cast<std::uint64_t>(bytes), std::memory_order_relaxed);
+#else
+        (void)impl;
+        (void)bytes;
+#endif
+}
 
 } // namespace ukcp

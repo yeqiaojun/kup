@@ -24,8 +24,8 @@ class Session {
         [[nodiscard]] SessionImpl *raw_impl() noexcept;
         [[nodiscard]] const SessionImpl *raw_impl() const noexcept;
 
-        bool Send(std::span<const std::uint8_t> payload);
-        bool SendRawUdp(std::uint32_t packet_seq, std::span<const std::uint8_t> payload);
+        bool SendKcp(std::span<const std::uint8_t> payload);
+        bool SendUdp(std::uint32_t packet_seq, std::span<const std::uint8_t> payload);
         void Close(const std::string &reason = "session closed");
 
       private:

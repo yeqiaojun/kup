@@ -10,9 +10,9 @@ class EchoHandler final : public ukcp::Handler {
                 return std::string(payload.begin(), payload.end()) == "auth";
         }
 
-        void OnUDP(ukcp::Session &session, std::uint32_t, std::span<const std::uint8_t> payload) override { session.Send(payload); }
+        void OnUDP(ukcp::Session &session, std::uint32_t, std::span<const std::uint8_t> payload) override { session.SendKcp(payload); }
 
-        void OnKCP(ukcp::Session &session, std::span<const std::uint8_t> payload) override { session.Send(payload); }
+        void OnKCP(ukcp::Session &session, std::span<const std::uint8_t> payload) override { session.SendKcp(payload); }
 };
 
 } // namespace

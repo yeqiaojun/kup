@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(UKCP_SERVER_BUILD_TESTS "Build ukcp_server tests" ON)
+option(UKCP_SERVER_ENABLE_STATS "Enable ukcp_server stats counters" OFF)
 
 set(UKCP_SERVER_SOURCES
     third_party/ikcp/ikcp.c
@@ -45,6 +46,9 @@ target_include_directories(ukcp_server
 
 target_compile_definitions(ukcp_server PRIVATE
     $<$<PLATFORM_ID:Windows>:NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS>
+)
+target_compile_definitions(ukcp_server PUBLIC
+    $<$<BOOL:${UKCP_SERVER_ENABLE_STATS}>:UKCP_ENABLE_STATS=1>
 )
 target_link_libraries(ukcp_server
     PUBLIC
