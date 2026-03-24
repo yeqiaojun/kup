@@ -374,6 +374,33 @@ UKCP_TEST(Server_SendKcpRejectsPayloadAboveKcpLimit) {
         server.Close();
 }
 
+UKCP_TEST(Server_CanCloseSessionById) {
+        RecordingHandler handler;
+        handler.expected_sess_id = 1024;
+        Server server("127.0.0.1:39124", handler, Config{});
+        UKCP_REQUIRE(server.Start());
+
+        TestKcpClient client("127.0.0.1:39124", 1024);
+        client.SendAuth("auth");
+        WaitUntil([&] { return handler.open_count.load() == 1; }, std::chrono::milliseconds(2000), "auth did not open session");
+
+        UKCP_REQUIRE(server.CloseSession(1024, "server kick"));
+        WaitUntil([&] { return handler.close_count.load() == 1; }, std::chrono::milliseconds(2000), "server did not close session");
+        WaitUntil([&] { return server.FindSession(1024) == nullptr; }, std::chrono::milliseconds(2000), "session still present after close");
+        UKCP_REQUIRE(handler.close_events.WaitFor(std::chrono::milliseconds(2000)) == "server kick");
+        UKCP_REQUIRE(!server.SendKcpToSess(1024, Bytes("after-close")));
+        server.Close();
+}
+
+UKCP_TEST(Server_CloseSessionReturnsFalseWhenMissing) {
+        RecordingHandler handler;
+        Server server("127.0.0.1:39125", handler, Config{});
+        UKCP_REQUIRE(server.Start());
+
+        UKCP_REQUIRE(!server.CloseSession(999999, "missing"));
+        server.Close();
+}
+
 #if !UKCP_ENABLE_STATS
 UKCP_TEST(Server_StatsReturnZeroWhenDisabled) {
         RecordingHandler handler;

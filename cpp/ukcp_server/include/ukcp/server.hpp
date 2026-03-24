@@ -36,6 +36,7 @@ class Server {
 
         bool Start();
         void Close();
+        bool CloseSession(std::uint32_t sess_id, const std::string &reason = "session closed");
         bool SetMtu(int mtu);
 
         [[nodiscard]] bool IsRunning() const noexcept;

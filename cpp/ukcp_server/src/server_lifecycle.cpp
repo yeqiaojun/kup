@@ -14,6 +14,23 @@ struct SessionResources {
         ikcpcb *kcp{nullptr};
 };
 
+void FinalizeSessionClose(ServerImpl &impl, std::unique_ptr<Session> session, const std::string &close_reason) {
+        if (session == nullptr) { return; }
+        ReleaseSessionResources(impl, *session->raw_impl());
+        impl.handler->OnSessionClose(*session, close_reason);
+}
+
+void CloseOwnedSession(ServerImpl &impl, std::unique_ptr<Session> session, const std::string &reason) {
+        if (session == nullptr) { return; }
+        session->Close(reason);
+        std::string close_reason;
+        {
+                std::shared_lock lock(session->raw_impl()->mutex);
+                close_reason = session->raw_impl()->close_reason;
+        }
+        FinalizeSessionClose(impl, std::move(session), close_reason);
+}
+
 SessionResources DetachSessionResources(SessionImpl &session_impl) {
         SessionResources resources{};
         std::unique_lock lock(session_impl.mutex);
@@ -98,9 +115,7 @@ Session *ActivatePending(ServerImpl &impl, PendingAuth &&pending) {
         }
 
         if (replaced != nullptr) {
-                replaced->Close(ReasonReplaced());
-                ReleaseSessionResources(impl, *replaced->raw_impl());
-                impl.handler->OnSessionClose(*replaced, ReasonReplaced());
+                CloseOwnedSession(impl, std::move(replaced), ReasonReplaced());
         }
 
         impl.handler->OnSessionOpen(*inserted_ptr);
@@ -129,8 +144,7 @@ void CloseSessionIfNeeded(ServerImpl &impl, Session &session) {
                 std::shared_lock lock(session_impl->mutex);
                 close_reason = session_impl->close_reason;
         }
-        ReleaseSessionResources(impl, *session_impl);
-        impl.handler->OnSessionClose(*owned, close_reason);
+        FinalizeSessionClose(impl, std::move(owned), close_reason);
 }
 
 Session *ServerImpl::FindSessionLocked(std::uint32_t sess_id) const {
@@ -188,19 +202,26 @@ void Server::Close() {
                 impl_->sessions.clear();
         }
 
-        for (auto &session : sessions) {
-                session->Close(ReasonServerClosed());
-                std::string close_reason;
-                {
-                        std::shared_lock lock(session->raw_impl()->mutex);
-                        close_reason = session->raw_impl()->close_reason;
-                }
-                ReleaseSessionResources(*impl_, *session->raw_impl());
-                impl_->handler->OnSessionClose(*session, close_reason);
-        }
+        for (auto &session : sessions) { CloseOwnedSession(*impl_, std::move(session), ReasonServerClosed()); }
 }
 
 bool Server::IsRunning() const noexcept { return impl_ && impl_->running.load(std::memory_order_relaxed); }
+
+bool Server::CloseSession(std::uint32_t sess_id, const std::string &reason) {
+        if (!impl_) { return false; }
+
+        std::unique_ptr<Session> session;
+        {
+                std::unique_lock lock(impl_->mutex);
+                auto it = impl_->sessions.find(sess_id);
+                if (it == impl_->sessions.end()) { return false; }
+                session = std::move(it->second);
+                impl_->sessions.erase(it);
+        }
+
+        CloseOwnedSession(*impl_, std::move(session), reason);
+        return true;
+}
 
 ServerStatsSnapshot Server::Stats() const {
         ServerStatsSnapshot snapshot{};
