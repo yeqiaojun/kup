@@ -61,6 +61,7 @@ struct ServerImpl {
         std::thread recv_thread{};
         std::thread update_thread{};
 
+        // Locking rule: never hold ServerImpl::mutex and SessionImpl::mutex at the same time.
         mutable std::shared_mutex mutex;
         std::unordered_map<std::uint32_t, std::unique_ptr<Session>> sessions;
         std::unordered_map<std::uint32_t, PendingAuth> pending;

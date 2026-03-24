@@ -9,6 +9,27 @@ namespace {
 std::string ReasonReplaced() { return "session replaced"; }
 std::string ReasonServerClosed() { return "server closed"; }
 
+struct SessionResources {
+        SocketHandle socket_fd{kInvalidSocket};
+        ikcpcb *kcp{nullptr};
+};
+
+SessionResources DetachSessionResources(SessionImpl &session_impl) {
+        SessionResources resources{};
+        std::unique_lock lock(session_impl.mutex);
+        resources.socket_fd = session_impl.socket_fd;
+        session_impl.socket_fd = kInvalidSocket;
+        resources.kcp = session_impl.kcp;
+        session_impl.kcp = nullptr;
+        return resources;
+}
+
+void EraseSessionSocket(ServerImpl &impl, SocketHandle socket_fd) {
+        if (socket_fd == kInvalidSocket) { return; }
+        std::unique_lock lock(impl.mutex);
+        impl.session_sockets.erase(socket_fd);
+}
+
 } // namespace
 
 std::vector<Session *> &SessionScratch() {
@@ -17,25 +38,14 @@ std::vector<Session *> &SessionScratch() {
 }
 
 void ReleaseSessionResources(ServerImpl &impl, SessionImpl &session_impl) {
-        SocketHandle socket_fd = kInvalidSocket;
-        ikcpcb *kcp = nullptr;
-        {
-                std::unique_lock lock(session_impl.mutex);
-                socket_fd = session_impl.socket_fd;
-                session_impl.socket_fd = kInvalidSocket;
-                kcp = session_impl.kcp;
-                session_impl.kcp = nullptr;
-        }
-
+        const auto resources = DetachSessionResources(session_impl);
+        const auto socket_fd = resources.socket_fd;
         if (socket_fd != kInvalidSocket) {
                 impl.poller.Unregister(socket_fd);
-                {
-                        std::unique_lock lock(impl.mutex);
-                        impl.session_sockets.erase(socket_fd);
-                }
+                EraseSessionSocket(impl, socket_fd);
                 CloseSocket(socket_fd);
         }
-        if (kcp != nullptr) { ikcp_release(kcp); }
+        if (resources.kcp != nullptr) { ikcp_release(resources.kcp); }
 }
 
 Session *ActivatePending(ServerImpl &impl, PendingAuth &&pending) {
@@ -89,8 +99,8 @@ Session *ActivatePending(ServerImpl &impl, PendingAuth &&pending) {
 
         if (replaced != nullptr) {
                 replaced->Close(ReasonReplaced());
-                impl.handler->OnSessionClose(*replaced, ReasonReplaced());
                 ReleaseSessionResources(impl, *replaced->raw_impl());
+                impl.handler->OnSessionClose(*replaced, ReasonReplaced());
         }
 
         impl.handler->OnSessionOpen(*inserted_ptr);
@@ -174,14 +184,12 @@ void Server::Close() {
                 }
                 impl_->pending.clear();
                 impl_->session_sockets.clear();
-                for (auto &[_, session] : impl_->sessions) {
-                        session->Close(ReasonServerClosed());
-                        sessions.push_back(std::move(session));
-                }
+                for (auto &[_, session] : impl_->sessions) { sessions.push_back(std::move(session)); }
                 impl_->sessions.clear();
         }
 
         for (auto &session : sessions) {
+                session->Close(ReasonServerClosed());
                 std::string close_reason;
                 {
                         std::shared_lock lock(session->raw_impl()->mutex);
