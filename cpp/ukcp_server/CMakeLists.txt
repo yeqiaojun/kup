@@ -12,6 +12,7 @@ option(UKCP_SERVER_ENABLE_STATS "Enable ukcp_server stats counters" OFF)
 
 set(UKCP_SERVER_SOURCES
     third_party/ikcp/ikcp.c
+    src/client.cpp
     src/protocol.cpp
     src/platform_socket_common.cpp
     src/server.cpp
@@ -83,6 +84,7 @@ if(UKCP_SERVER_BUILD_TESTS)
     enable_testing()
     add_executable(ukcp_server_tests
         tests/test_main.cpp
+        tests/client_test.cpp
         tests/protocol_test.cpp
         tests/session_layout_test.cpp
         tests/server_test.cpp
