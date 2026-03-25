@@ -1,5 +1,6 @@
 #include "test_support.hpp"
 
+#include "kcp_limits.hpp"
 #include "ukcp/client.hpp"
 #include "ukcp/server.hpp"
 
@@ -95,5 +96,22 @@ UKCP_TEST(UkcpClient_CloseStopsFurtherSends) {
         client.Close();
         UKCP_REQUIRE(!client.SendKcp(ukcp::test::Bytes("after-close")));
         UKCP_REQUIRE(!client.SendUdp(88, ukcp::test::Bytes("after-close")));
+        server.Close();
+}
+
+UKCP_TEST(UkcpClient_RejectsPayloadAboveConfiguredMtuLimit) {
+        AcceptHandler handler;
+        ukcp::Config config{};
+        config.kcp.mtu = 1024;
+
+        ukcp::Server server("127.0.0.1:39133", handler, config);
+        UKCP_REQUIRE(server.Start());
+
+        ukcp::Client client("127.0.0.1:39133", 1033, config);
+        UKCP_REQUIRE(client.Connect(ukcp::test::Bytes("auth")));
+        ukcp::test::WaitUntil([&] { return server.FindSession(1033) != nullptr; }, std::chrono::milliseconds(2000), "client auth did not open session");
+
+        std::vector<std::uint8_t> payload(ukcp::MaxKcpPayloadSizeForTransportMtu(config.kcp.mtu) + 1, static_cast<std::uint8_t>('x'));
+        UKCP_REQUIRE(!client.SendKcp(payload));
         server.Close();
 }

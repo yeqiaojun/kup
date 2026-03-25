@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using UkcpSharp;
 using Xunit;
 
@@ -9,48 +10,78 @@ namespace UkcpSharp.Tests;
 public sealed class UkcpClientTests
 {
     [Fact]
-    public void SendUdp_RequiresAuthToBeStarted()
+    public void Config_DefaultMtuIs1024()
     {
-        var socket = new FakeDatagramSocket();
-        var client = CreateClient(socket, 7001);
-        client.Connect();
+        var config = new UkcpClientConfig();
 
-        Assert.Throws<InvalidOperationException>(() => client.SendUdp(7, new byte[] { 1, 2, 3 }, 3));
+        Assert.Equal(1024u, config.Mtu);
     }
 
     [Fact]
-    public void SendUdp_RepeatsSameLogicalPacket()
+    public void Connect_SendsAuthPacketWithConnectFlag()
+    {
+        var socket = new FakeDatagramSocket();
+        var client = CreateClient(socket, 7001);
+
+        Assert.True(client.Connect(new byte[] { 0x41, 0x55, 0x54, 0x48 }));
+        Assert.True(socket.ConnectedCalled);
+        Assert.NotEmpty(socket.Sent);
+        Assert.True(UkcpHeader.TryDecode(socket.Sent[0], out var header));
+        Assert.Equal(UkcpMessageType.Kcp, header.MessageType);
+        Assert.Equal(UkcpHeaderFlags.Connect, header.Flags);
+    }
+
+    [Fact]
+    public void Connect_ConfiguresKcpMtuAsTransportMinusHeader()
     {
         var socket = new FakeDatagramSocket();
         var client = CreateClient(socket, 7002);
-        client.Connect();
-        client.SendAuth(new byte[] { 0x41, 0x55, 0x54, 0x48 });
+
+        Assert.True(client.Connect(new byte[] { 0x41, 0x55, 0x54, 0x48 }));
+
+        var kcp = Assert.IsType<kcp2k.Kcp>(typeof(UkcpClient).GetField("_kcp", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(client));
+        uint mtu = ReadUIntField(kcp, "mtu");
+        uint mss = ReadUIntField(kcp, "mss");
+
+        Assert.Equal(1024u - (uint)UkcpHeader.Size, mtu);
+        Assert.Equal(1024u - (uint)UkcpHeader.Size - (uint)kcp2k.Kcp.OVERHEAD, mss);
+    }
+
+    [Fact]
+    public void SendUdp_SendsSingleLogicalPacket()
+    {
+        var socket = new FakeDatagramSocket();
+        var client = CreateClient(socket, 7003);
+        Assert.True(client.Connect(new byte[] { 0x41, 0x55, 0x54, 0x48 }));
 
         socket.ClearSent();
-        client.SendUdp(11, new byte[] { 0xAA, 0xBB }, 3);
+        Assert.True(client.SendUdp(11, new byte[] { 0xAA, 0xBB }));
 
-        Assert.Equal(3, socket.Sent.Count);
-        foreach (var datagram in socket.Sent)
-        {
-            Assert.True(UkcpHeader.TryDecode(datagram.AsSpan(0, UkcpHeader.Size).ToArray(), out var header));
-            Assert.Equal(UkcpMessageType.Udp, header.MessageType);
-            Assert.Equal((ushort)2, header.BodyLength);
-            Assert.Equal(7002u, header.SessId);
-            Assert.Equal(11u, header.PacketSeq);
-            Assert.Equal(new byte[] { 0xAA, 0xBB }, datagram.Skip(UkcpHeader.Size).ToArray());
-        }
+        Assert.Single(socket.Sent);
+        Assert.True(UkcpHeader.TryDecode(socket.Sent[0], out var header));
+        Assert.Equal(UkcpMessageType.Udp, header.MessageType);
+        Assert.Equal((ushort)2, header.BodyLength);
+        Assert.Equal(7003u, header.SessId);
+        Assert.Equal(11u, header.PacketSeq);
+        Assert.Equal(new byte[] { 0xAA, 0xBB }, socket.Sent[0].Skip(UkcpHeader.Size).ToArray());
     }
 
     [Fact]
     public void SendKcp_ProducesDatagramsThatRemotePeerCanRead()
     {
         var socket = new FakeDatagramSocket();
-        var client = CreateClient(socket, 7003);
-        client.Connect();
+        var client = CreateClient(socket, 7004);
+        Assert.True(client.Connect(new byte[] { 0x41, 0x55, 0x54, 0x48 }));
 
-        client.SendKcp(new byte[] { 0x10, 0x11, 0x12 });
+        var remote = new LoopbackKcpPeer(7004, 1024u);
+        foreach (var datagram in socket.Sent)
+        {
+            remote.InputWrapped(datagram);
+        }
+        Assert.Equal(new byte[] { 0x41, 0x55, 0x54, 0x48 }, remote.Receive());
 
-        var remote = new LoopbackKcpPeer(7003);
+        socket.ClearSent();
+        Assert.True(client.SendKcp(new byte[] { 0x10, 0x11, 0x12 }));
         foreach (var datagram in socket.Sent)
         {
             remote.InputWrapped(datagram);
@@ -60,166 +91,81 @@ public sealed class UkcpClientTests
     }
 
     [Fact]
-    public void Poll_RaisesKcpMessageForInboundWrappedPackets()
+    public void Poll_Recv_ReturnsInboundKcpPayload()
     {
         var socket = new FakeDatagramSocket();
-        var client = CreateClient(socket, 7004);
-        client.Connect();
+        var client = CreateClient(socket, 7005);
+        Assert.True(client.Connect(new byte[] { 0x41, 0x55, 0x54, 0x48 }));
 
-        byte[]? received = null;
-        client.KcpMessage += payload => received = payload;
-
-        var remote = new LoopbackKcpPeer(7004);
+        var remote = new LoopbackKcpPeer(7005, 1024u);
         foreach (var datagram in remote.SendWrapped(new byte[] { 0x21, 0x22, 0x23 }))
         {
             socket.QueueReceive(datagram);
         }
 
-        client.Poll();
-
+        Assert.True(client.Poll());
+        Assert.True(client.Recv(out var received));
         Assert.Equal(new byte[] { 0x21, 0x22, 0x23 }, received);
     }
 
     [Fact]
-    public void Reconnect_SwapsSocketAndKeepsSending()
-    {
-        var socket1 = new FakeDatagramSocket();
-        var socket2 = new FakeDatagramSocket();
-        var sockets = new Queue<FakeDatagramSocket>(new[] { socket1, socket2 });
-        var client = new UkcpClient(new UkcpClientConfig
-        {
-            Host = "127.0.0.1",
-            Port = 9000,
-            SessId = 7005,
-            SocketFactory = () => sockets.Dequeue()
-        });
-
-        client.Connect();
-        client.SendAuth(new byte[] { 0x41, 0x55, 0x54, 0x48 });
-        Assert.NotEmpty(socket1.Sent);
-
-        client.Reconnect();
-        client.SendUdp(9, new byte[] { 0x31, 0x32, 0x33 });
-
-        Assert.True(socket1.ClosedCalled);
-        Assert.NotEmpty(socket2.Sent);
-    }
-
-    [Fact]
-    public void ConnectAndAuth_SendsAuthPacketWithConnectFlag()
+    public void Poll_Recv_ReturnsInboundUdpPayloadWithoutHeader()
     {
         var socket = new FakeDatagramSocket();
         var client = CreateClient(socket, 7006);
+        Assert.True(client.Connect(new byte[] { 0x41, 0x55, 0x54, 0x48 }));
 
-        client.ConnectAndAuth(new byte[] { 0x41, 0x55, 0x54, 0x48 });
+        byte[] packet = new UkcpHeader(UkcpMessageType.Udp, UkcpHeaderFlags.None, 3, 7006u, 99).Wrap(new byte[] { 0x31, 0x32, 0x33 });
+        socket.QueueReceive(packet);
 
-        Assert.True(socket.ConnectedCalled);
-        Assert.NotEmpty(socket.Sent);
-        Assert.True(UkcpHeader.TryDecode(socket.Sent[0].AsSpan(0, UkcpHeader.Size).ToArray(), out var header));
-        Assert.Equal(UkcpMessageType.Kcp, header.MessageType);
-        Assert.Equal(UkcpHeaderFlags.Connect, header.Flags);
+        Assert.True(client.Poll());
+        Assert.True(client.Recv(out var received));
+        Assert.Equal(new byte[] { 0x31, 0x32, 0x33 }, received);
     }
 
     [Fact]
-    public void Resume_ReconnectsAndSendsPlainKcp()
+    public void SendKcp_ReturnsFalseWhenPayloadExceedsSingleMessageLimit()
     {
-        var socket1 = new FakeDatagramSocket();
-        var socket2 = new FakeDatagramSocket();
-        var sockets = new Queue<FakeDatagramSocket>(new[] { socket1, socket2 });
-        var client = new UkcpClient(new UkcpClientConfig
-        {
-            Host = "127.0.0.1",
-            Port = 9000,
-            SessId = 7007,
-            SocketFactory = () => sockets.Dequeue()
-        });
+        var socket = new FakeDatagramSocket();
+        var client = CreateClient(socket, 7007);
+        Assert.True(client.Connect(new byte[] { 0x41, 0x55, 0x54, 0x48 }));
 
-        client.ConnectAndAuth(new byte[] { 0x41, 0x55, 0x54, 0x48 });
-        socket2.OnSend = _ => { };
+        socket.ClearSent();
+        int maxPayload = checked((int)((1024u - (uint)UkcpHeader.Size - (uint)kcp2k.Kcp.OVERHEAD) * 127u));
+        byte[] payload = new byte[maxPayload + 1];
 
-        client.Resume(new byte[] { 0x50, 0x49, 0x4E, 0x47 });
-
-        Assert.True(socket1.ClosedCalled);
-        Assert.NotEmpty(socket2.Sent);
-        Assert.True(UkcpHeader.TryDecode(socket2.Sent[0].AsSpan(0, UkcpHeader.Size).ToArray(), out var header));
-        Assert.Equal(UkcpHeaderFlags.None, header.Flags);
+        Assert.False(client.SendKcp(payload));
+        Assert.Empty(socket.Sent);
     }
 
     [Fact]
-    public void ResumeOrRedial_ReturnsResumedWhenInboundKcpArrives()
+    public void Close_StopsFurtherSends()
     {
-        var socket1 = new FakeDatagramSocket();
-        var socket2 = new FakeDatagramSocket();
-        var sockets = new Queue<FakeDatagramSocket>(new[] { socket1, socket2 });
-        var client = new UkcpClient(new UkcpClientConfig
-        {
-            Host = "127.0.0.1",
-            Port = 9000,
-            SessId = 7008,
-            SocketFactory = () => sockets.Dequeue()
-        });
-        var remote = new LoopbackKcpPeer(7008);
+        var socket = new FakeDatagramSocket();
+        var client = CreateClient(socket, 7008);
+        Assert.True(client.Connect(new byte[] { 0x41, 0x55, 0x54, 0x48 }));
 
-        client.ConnectAndAuth(new byte[] { 0x41, 0x55, 0x54, 0x48 });
-        socket2.OnSend = _ =>
-        {
-            foreach (var datagram in remote.SendWrapped(new byte[] { 0x61, 0x63, 0x6B }))
-            {
-                socket2.QueueReceive(datagram);
-            }
-        };
+        client.Close();
 
-        UkcpResumeResult result = client.ResumeOrRedial(
-            new byte[] { 0x41, 0x55, 0x54, 0x48 },
-            new byte[] { 0x50, 0x49, 0x4E, 0x47 },
-            50,
-            1);
-
-        Assert.Equal(UkcpResumeResult.Resumed, result);
-        Assert.True(socket1.ClosedCalled);
-        Assert.False(socket2.ClosedCalled);
+        Assert.False(client.IsConnected);
+        Assert.True(socket.ClosedCalled);
+        Assert.False(client.SendKcp(new byte[] { 0x01 }));
+        Assert.False(client.SendUdp(7, new byte[] { 0x02 }));
+        Assert.False(client.Poll());
+        Assert.False(client.Recv(out _));
     }
 
-    [Fact]
-    public void ResumeOrRedial_RedialsWhenResumeTimesOut()
+    private static UkcpClient CreateClient(FakeDatagramSocket socket, uint sessId, UkcpClientConfig? config = null)
     {
-        var socket1 = new FakeDatagramSocket();
-        var socket2 = new FakeDatagramSocket();
-        var socket3 = new FakeDatagramSocket();
-        var sockets = new Queue<FakeDatagramSocket>(new[] { socket1, socket2, socket3 });
-        var client = new UkcpClient(new UkcpClientConfig
-        {
-            Host = "127.0.0.1",
-            Port = 9000,
-            SessId = 7009,
-            SocketFactory = () => sockets.Dequeue()
-        });
-
-        client.ConnectAndAuth(new byte[] { 0x41, 0x55, 0x54, 0x48 });
-
-        UkcpResumeResult result = client.ResumeOrRedial(
-            new byte[] { 0x41, 0x55, 0x54, 0x48 },
-            new byte[] { 0x50, 0x49, 0x4E, 0x47 },
-            10,
-            1);
-
-        Assert.Equal(UkcpResumeResult.Redialed, result);
-        Assert.True(socket1.ClosedCalled);
-        Assert.True(socket2.ClosedCalled);
-        Assert.NotEmpty(socket3.Sent);
-        Assert.True(UkcpHeader.TryDecode(socket3.Sent[0].AsSpan(0, UkcpHeader.Size).ToArray(), out var header));
-        Assert.Equal(UkcpHeaderFlags.Connect, header.Flags);
+        UkcpClientConfig effectiveConfig = config ?? new UkcpClientConfig();
+        effectiveConfig.SocketFactory = () => socket;
+        return new UkcpClient("127.0.0.1:9000", sessId, effectiveConfig);
     }
 
-    private static UkcpClient CreateClient(FakeDatagramSocket socket, uint sessId)
+    private static uint ReadUIntField(object instance, string name)
     {
-        return new UkcpClient(new UkcpClientConfig
-        {
-            Host = "127.0.0.1",
-            Port = 9000,
-            SessId = sessId,
-            SocketFactory = () => socket
-        });
+        return (uint)(typeof(kcp2k.Kcp).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)!.GetValue(instance)
+            ?? throw new InvalidOperationException("missing field"));
     }
 
     private sealed class FakeDatagramSocket : IDatagramSocket
@@ -227,7 +173,6 @@ public sealed class UkcpClientTests
         private readonly Queue<byte[]> _received = new Queue<byte[]>();
 
         public readonly List<byte[]> Sent = new List<byte[]>();
-        public Action<byte[]>? OnSend;
 
         public void Connect(string host, int port)
         {
@@ -239,7 +184,6 @@ public sealed class UkcpClientTests
             var copy = new byte[length];
             Buffer.BlockCopy(datagram, 0, copy, 0, length);
             Sent.Add(copy);
-            if (OnSend != null) OnSend(copy);
         }
 
         public bool TryReceive(byte[] buffer, out int length)
@@ -281,7 +225,7 @@ public sealed class UkcpClientTests
         private readonly kcp2k.Kcp _kcp;
         private readonly List<byte[]> _segments = new List<byte[]>();
 
-        public LoopbackKcpPeer(uint sessId)
+        public LoopbackKcpPeer(uint sessId, uint transportMtu)
         {
             _sessId = sessId;
             _kcp = new kcp2k.Kcp(sessId, (buffer, size) =>
@@ -292,7 +236,7 @@ public sealed class UkcpClientTests
             });
             _kcp.SetNoDelay(1, 10, 2, true);
             _kcp.SetWindowSize(128, 128);
-            _kcp.SetMtu(1200);
+            _kcp.SetMtu(transportMtu - (uint)UkcpHeader.Size);
         }
 
         public IReadOnlyList<byte[]> SendWrapped(byte[] payload)
@@ -308,7 +252,7 @@ public sealed class UkcpClientTests
 
         public void InputWrapped(byte[] datagram)
         {
-            Assert.True(UkcpHeader.TryDecode(datagram.AsSpan(0, UkcpHeader.Size).ToArray(), out var header));
+            Assert.True(UkcpHeader.TryDecode(datagram, out var header));
             Assert.Equal(UkcpMessageType.Kcp, header.MessageType);
             byte[] body = datagram.Skip(UkcpHeader.Size).ToArray();
             Assert.Equal(0, _kcp.Input(body, 0, body.Length));

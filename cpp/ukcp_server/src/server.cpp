@@ -4,14 +4,6 @@
 
 namespace ukcp {
 
-namespace {
-
-constexpr int kMinKcpMtu = 50;
-
-int KcpMtuFromTransportMtu(int mtu) { return mtu - static_cast<int>(Header::kSize); }
-
-} // namespace
-
 Server::Server(std::string listen_addr, Handler &handler, Config config) : impl_(std::make_unique<ServerImpl>()) {
         impl_->listen_addr = std::move(listen_addr);
         impl_->handler = &handler;

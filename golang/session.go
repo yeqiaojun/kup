@@ -13,10 +13,12 @@ import (
 )
 
 var (
-	ErrSessionClosed     = errors.New("ukcp: session closed")
-	ErrSessionReplaced   = errors.New("ukcp: session replaced")
-	ErrSessionQueueFull  = errors.New("ukcp: session queue full")
-	ErrRemoteAddrUnknown = errors.New("ukcp: remote addr unknown")
+	ErrSessionClosed      = errors.New("ukcp: session closed")
+	ErrSessionReplaced    = errors.New("ukcp: session replaced")
+	ErrSessionQueueFull   = errors.New("ukcp: session queue full")
+	ErrRemoteAddrUnknown  = errors.New("ukcp: remote addr unknown")
+	ErrKcpPayloadTooLarge = errors.New("ukcp: kcp payload too large")
+	ErrPayloadTooLarge    = errors.New("ukcp: payload too large")
 )
 
 type Session struct {
@@ -31,13 +33,16 @@ type Session struct {
 	closed    chan struct{}
 	lastKCPAt atomic.Int64
 	recvBuf   []byte
+
+	transportMTU int
 }
 
 type sessionEventKind uint8
 
 const (
 	sessionEventInbound sessionEventKind = iota + 1
-	sessionEventSend
+	sessionEventSendKcp
+	sessionEventSendUdp
 	sessionEventDrain
 )
 
@@ -49,27 +54,32 @@ type inboundPacket struct {
 }
 
 type sessionEvent struct {
-	kind    sessionEventKind
-	inbound inboundPacket
-	payload []byte
+	kind      sessionEventKind
+	inbound   inboundPacket
+	payload   []byte
+	packetSeq uint32
 }
 
-func newSession(server *Server, id uint32, transport *sessionTransport, state *kcp.KCP) *Session {
+func newSession(server *Server, id uint32, transport *sessionTransport, state *kcp.KCP, transportMTU int) *Session {
 	if transport == nil {
 		transport = newSessionTransport(server, id, nil)
 	}
+	if transportMTU <= 0 {
+		transportMTU = server.config.KCP.MTU
+	}
 	sess := &Session{
-		id:        id,
-		server:    server,
-		transport: transport,
-		events:    make(chan sessionEvent, server.config.SessionQueueSize),
-		closeCh:   make(chan error, 1),
-		closed:    make(chan struct{}),
+		id:           id,
+		server:       server,
+		transport:    transport,
+		events:       make(chan sessionEvent, server.config.SessionQueueSize),
+		closeCh:      make(chan error, 1),
+		closed:       make(chan struct{}),
+		transportMTU: transportMTU,
 	}
 	if state != nil {
 		sess.kcp = state
 	} else {
-		sess.kcp = newKCPState(server, id, transport)
+		sess.kcp = newKCPState(server.config, id, transport, transportMTU)
 	}
 	sess.markKCPActive(time.Now())
 
@@ -86,7 +96,7 @@ func (s *Session) RemoteAddr() net.Addr {
 	return s.transport.addr()
 }
 
-func (s *Session) Send(payload []byte) error {
+func (s *Session) SendKcp(payload []byte) error {
 	if s.server.isClosed() {
 		return ErrServerClosed
 	}
@@ -96,10 +106,36 @@ func (s *Session) Send(payload []byte) error {
 	if s.RemoteAddr() == nil {
 		return ErrRemoteAddrUnknown
 	}
+	if len(payload) > maxKcpPayloadForTransportMtu(s.transportMTU) {
+		return ErrKcpPayloadTooLarge
+	}
 
 	body := append([]byte(nil), payload...)
 	select {
-	case s.events <- sessionEvent{kind: sessionEventSend, payload: body}:
+	case s.events <- sessionEvent{kind: sessionEventSendKcp, payload: body}:
+		return nil
+	default:
+		return ErrSessionQueueFull
+	}
+}
+
+func (s *Session) SendUdp(packetSeq uint32, payload []byte) error {
+	if s.server.isClosed() {
+		return ErrServerClosed
+	}
+	if s.isClosed() {
+		return ErrSessionClosed
+	}
+	if s.RemoteAddr() == nil {
+		return ErrRemoteAddrUnknown
+	}
+	if len(payload) > maxPacketBodyLen {
+		return ErrPayloadTooLarge
+	}
+
+	body := append([]byte(nil), payload...)
+	select {
+	case s.events <- sessionEvent{kind: sessionEventSendUdp, packetSeq: packetSeq, payload: body}:
 		return nil
 	default:
 		return ErrSessionQueueFull
@@ -108,6 +144,10 @@ func (s *Session) Send(payload []byte) error {
 
 func (s *Session) Close() error {
 	return s.closeWithReason(ErrSessionClosed)
+}
+
+func (s *Session) CloseWithReason(reason string) error {
+	return s.closeWithReason(closeReasonError(reason, ErrSessionClosed))
 }
 
 func (s *Session) closeWithReason(reason error) error {
@@ -169,11 +209,13 @@ func (s *Session) loop() {
 						s.drainKCP()
 					}
 				}
-			case sessionEventSend:
+			case sessionEventSendKcp:
 				if s.kcp.Send(event.payload) == 0 {
 					s.kcp.Update()
 					s.drainKCP()
 				}
+			case sessionEventSendUdp:
+				s.transport.writeUDP(event.packetSeq, event.payload)
 			case sessionEventDrain:
 				s.drainKCP()
 			}
@@ -296,18 +338,45 @@ func (t *sessionTransport) writeKCP(payload []byte) {
 	t.server.releasePacketBuffer(packet)
 }
 
-func newKCPState(server *Server, id uint32, transport *sessionTransport) *kcp.KCP {
+func (t *sessionTransport) writeUDP(packetSeq uint32, payload []byte) {
+	addr := t.addr()
+	if addr == nil || t.server.isClosed() {
+		return
+	}
+
+	size := protocol.HeaderSize + len(payload)
+	packet := t.server.acquirePacketBuffer(size)
+	header := protocol.Header{
+		MsgType:   protocol.MsgTypeUDP,
+		BodyLen:   uint16(len(payload)),
+		SessID:    t.sessID,
+		PacketSeq: packetSeq,
+	}
+	if err := header.EncodeTo(packet[:protocol.HeaderSize]); err != nil {
+		t.server.releasePacketBuffer(packet)
+		return
+	}
+
+	copy(packet[protocol.HeaderSize:], payload)
+	_, _ = t.server.conn.WriteTo(packet, addr)
+	t.server.releasePacketBuffer(packet)
+}
+
+func newKCPState(config Config, id uint32, transport *sessionTransport, transportMTU int) *kcp.KCP {
 	state := kcp.NewKCP(id, func(buf []byte, size int) {
 		transport.writeKCP(buf[:size])
 	})
 	state.NoDelay(
-		server.config.KCP.NoDelay,
-		server.config.KCP.Interval,
-		server.config.KCP.Resend,
-		server.config.KCP.NoCongestion,
+		config.KCP.NoDelay,
+		config.KCP.Interval,
+		config.KCP.Resend,
+		config.KCP.NoCongestion,
 	)
-	state.WndSize(server.config.KCP.SendWindow, server.config.KCP.RecvWindow)
-	state.SetMtu(server.config.KCP.MTU)
+	state.WndSize(config.KCP.SendWindow, config.KCP.RecvWindow)
+	kcpMTU := kcpMtuFromTransportMtu(transportMTU)
+	if kcpMTU >= kcpMinMtu {
+		_ = state.SetMtu(kcpMTU)
+	}
 	return state
 }
 
@@ -326,4 +395,11 @@ func resetTimer(timer *time.Timer, d time.Duration) {
 		}
 	}
 	timer.Reset(d)
+}
+
+func closeReasonError(reason string, fallback error) error {
+	if reason == "" {
+		return fallback
+	}
+	return errors.New(reason)
 }

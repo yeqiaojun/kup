@@ -51,7 +51,7 @@ func newEchoHandler(logger *log.Logger) ukcp.Handler {
 			if logger != nil {
 				logger.Printf("udp sess=%d seq=%d payload=%q", sess.ID(), packetSeq, string(payload))
 			}
-			if err := sess.Send(payload); err != nil && logger != nil {
+			if err := sess.SendKcp(payload); err != nil && logger != nil {
 				logger.Printf("udp echo send failed sess=%d err=%v", sess.ID(), err)
 			}
 		},
@@ -59,7 +59,7 @@ func newEchoHandler(logger *log.Logger) ukcp.Handler {
 			if logger != nil {
 				logger.Printf("kcp sess=%d payload=%q", sess.ID(), string(payload))
 			}
-			if err := sess.Send(payload); err != nil && logger != nil {
+			if err := sess.SendKcp(payload); err != nil && logger != nil {
 				logger.Printf("kcp echo send failed sess=%d err=%v", sess.ID(), err)
 			}
 		},

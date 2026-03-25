@@ -362,13 +362,7 @@ UKCP_TEST(Server_SendKcpRejectsPayloadAboveKcpLimit) {
         Session *session = server.FindSession(1023);
         UKCP_REQUIRE(session != nullptr);
 
-        std::size_t max_payload = 0;
-        {
-                std::shared_lock lock(session->raw_impl()->mutex);
-                UKCP_REQUIRE(session->raw_impl()->kcp != nullptr);
-                max_payload = ukcp::MaxKcpPayloadSize(*session->raw_impl()->kcp);
-        }
-
+        const std::size_t max_payload = ukcp::MaxKcpPayloadSizeForTransportMtu(1024);
         std::vector<std::uint8_t> payload(max_payload + 1, static_cast<std::uint8_t>('x'));
         UKCP_REQUIRE(!session->SendKcp(payload));
         server.Close();

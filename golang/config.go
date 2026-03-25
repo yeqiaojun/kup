@@ -8,6 +8,7 @@ const (
 	defaultUDPDedupeWindow = 512
 	defaultUpdateInterval  = 10 * time.Millisecond
 	defaultFastReconnect   = 10 * time.Second
+	defaultTransportMTU    = 1024
 )
 
 type KCPConfig struct {
@@ -47,7 +48,7 @@ func (c Config) withDefaults() Config {
 		c.FastReconnectWindow = defaultFastReconnect
 	}
 	if c.KCP.MTU <= 0 {
-		c.KCP.MTU = 1200
+		c.KCP.MTU = defaultTransportMTU
 	}
 	if c.KCP.NoDelay == 0 {
 		c.KCP.NoDelay = 1

@@ -33,8 +33,8 @@ func TestCSharpClientInterop100(t *testing.T) {
 			mu.Lock()
 			counts[text]++
 			mu.Unlock()
-			if err := sess.Send(payload); err != nil {
-				t.Errorf("udp echo send failed: %v", err)
+			if err := sess.SendKcp(payload); err != nil {
+				t.Errorf("udp echo SendKcp failed: %v", err)
 			}
 		},
 		OnKCPFunc: func(sess *Session, payload []byte) {
@@ -43,8 +43,8 @@ func TestCSharpClientInterop100(t *testing.T) {
 			mu.Lock()
 			counts[text]++
 			mu.Unlock()
-			if err := sess.Send(payload); err != nil {
-				t.Errorf("kcp echo send failed: %v", err)
+			if err := sess.SendKcp(payload); err != nil {
+				t.Errorf("kcp echo SendKcp failed: %v", err)
 			}
 		},
 	}, Config{})
@@ -64,7 +64,7 @@ func TestCSharpClientInterop100(t *testing.T) {
 		"--sess", "9901",
 		"--count", "25",
 	)
-	cmd.Dir = "D:\\tkcp\\ukcp"
+	cmd.Dir = ".."
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		t.Fatalf("dotnet client timed out\n%s", string(output))

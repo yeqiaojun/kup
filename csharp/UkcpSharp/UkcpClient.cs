@@ -1,305 +1,321 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using kcp2k;
 
 namespace UkcpSharp
 {
-    public enum UkcpResumeResult
-    {
-        Resumed = 1,
-        Redialed = 2
-    }
-
     public sealed class UkcpClient
     {
+        private const uint MinKcpMtu = 50;
+        private const uint MaxKcpMessageFragments = 127;
+
         private readonly UkcpClientConfig _config;
+        private readonly string _host;
+        private readonly int _port;
         private readonly byte[] _receiveBuffer;
+        private readonly Queue<byte[]> _receivedMessages = new Queue<byte[]>();
 
-        private Kcp _kcp;
-        private IDatagramSocket _socket;
+        private readonly uint _sessId;
+        private Kcp? _kcp;
+        private IDatagramSocket? _socket;
         private bool _connected;
-        private bool _authStarted;
         private UkcpHeaderFlags _outputFlags;
-        private long _inboundKcpCount;
 
-        public UkcpClient(UkcpClientConfig config)
+        public UkcpClient(string serverAddress, uint sessId, UkcpClientConfig? config = null)
         {
-            _config = config ?? throw new ArgumentNullException(nameof(config));
-            if (_config.SessId == 0)
+            if (string.IsNullOrWhiteSpace(serverAddress))
             {
-                throw new ArgumentOutOfRangeException(nameof(config), "SessId must be non-zero.");
+                throw new ArgumentException("Server address is required.", nameof(serverAddress));
+            }
+            if (sessId == 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(sessId), "SessId must be non-zero.");
             }
 
-            _receiveBuffer = new byte[_config.PacketBufferSize];
-            _socket = _config.CreateSocket();
-            _kcp = CreateKcp();
+            _config = config ?? new UkcpClientConfig();
+            (_host, _port) = ParseServerAddress(serverAddress);
+            _sessId = sessId;
+            _receiveBuffer = new byte[_config.ReceiveBufferSize];
         }
 
-        public uint SessId { get { return _config.SessId; } }
-        public bool IsAuthStarted { get { return _authStarted; } }
+        public uint SessId => _sessId;
+        public bool IsConnected => _connected;
 
-        public event Action<byte[]>? KcpMessage;
-        public event Action<byte[]>? UdpMessage;
-        public event Action<string>? Error;
-        public event Action? Closed;
-
-        public void Connect()
-        {
-            if (_connected)
-            {
-                return;
-            }
-
-            _socket.Connect(_config.Host, _config.Port);
-            _connected = true;
-        }
-
-        public void ConnectAndAuth(byte[] authPayload)
+        public bool Connect(byte[] authPayload)
         {
             if (authPayload == null) throw new ArgumentNullException(nameof(authPayload));
-            Connect();
-            SendAuth(authPayload);
-        }
-
-        public void SendAuth(byte[] payload)
-        {
-            if (payload == null) throw new ArgumentNullException(nameof(payload));
-            EnsureConnected();
-            _authStarted = true;
-            SendKcpInternal(payload, UkcpHeaderFlags.Connect);
-        }
-
-        public void SendUdp(uint packetSeq, byte[] payload, int repeat = 1)
-        {
-            if (payload == null) throw new ArgumentNullException(nameof(payload));
-            EnsureConnected();
-            if (!_authStarted)
+            if (_connected || authPayload.Length == 0)
             {
-                throw new InvalidOperationException("Auth must start before sending UDP.");
+                return false;
             }
 
-            if (repeat <= 0)
+            try
             {
-                repeat = 1;
+                _socket = _config.CreateSocket();
+                _socket.Connect(_host, _port);
+
+                uint kcpMtu = KcpMtuFromTransportMtu(_config.Mtu);
+                if (kcpMtu < MinKcpMtu)
+                {
+                        Close();
+                        return false;
+                }
+
+                _kcp = CreateKcp(kcpMtu);
+                _connected = true;
+                _outputFlags = UkcpHeaderFlags.Connect;
+                bool sent = SendKcpInternal(authPayload);
+                _outputFlags = UkcpHeaderFlags.None;
+                if (!sent)
+                {
+                    Close();
+                }
+                return sent;
+            }
+            catch
+            {
+                Close();
+                return false;
+            }
+        }
+
+        public void Close()
+        {
+            _connected = false;
+            _outputFlags = UkcpHeaderFlags.None;
+            _receivedMessages.Clear();
+            if (_socket != null)
+            {
+                _socket.Close();
+                _socket = null;
+            }
+            _kcp = null;
+        }
+
+        public bool SendKcp(byte[] payload)
+        {
+            if (payload == null) throw new ArgumentNullException(nameof(payload));
+            return SendKcpInternal(payload);
+        }
+
+        public bool SendUdp(uint packetSeq, byte[] payload)
+        {
+            if (payload == null) throw new ArgumentNullException(nameof(payload));
+            if (!_connected || _socket == null)
+            {
+                return false;
             }
 
-            var header = new UkcpHeader(UkcpMessageType.Udp, UkcpHeaderFlags.None, checked((ushort)payload.Length), _config.SessId, packetSeq);
+            var header = new UkcpHeader(UkcpMessageType.Udp, UkcpHeaderFlags.None, checked((ushort)payload.Length), _sessId, packetSeq);
             byte[] packet = header.Wrap(payload);
-            for (int i = 0; i < repeat; i++)
+            _socket.Send(packet, packet.Length);
+            return true;
+        }
+
+        public bool Poll(int timeoutMs = 0)
+        {
+            if (!_connected || _socket == null || _kcp == null)
             {
-                _socket.Send(packet, packet.Length);
+                return false;
             }
-        }
-
-        public void SendKcp(byte[] payload)
-        {
-            if (payload == null) throw new ArgumentNullException(nameof(payload));
-            EnsureConnected();
-            SendKcpInternal(payload, UkcpHeaderFlags.None);
-        }
-
-        public void Reconnect()
-        {
-            EnsureConnected();
-
-            ReplaceSocket(closeCurrent: true);
-        }
-
-        public void Resume(byte[] resumePayload)
-        {
-            if (resumePayload == null) throw new ArgumentNullException(nameof(resumePayload));
-            Reconnect();
-            SendKcp(resumePayload);
-        }
-
-        public UkcpResumeResult ResumeOrRedial(byte[] authPayload, byte[] resumePayload, int timeoutMs = 3000, int pollIntervalMs = 5)
-        {
-            if (authPayload == null) throw new ArgumentNullException(nameof(authPayload));
-            if (resumePayload == null) throw new ArgumentNullException(nameof(resumePayload));
-
-            long beforeResume = _inboundKcpCount;
-            Resume(resumePayload);
 
             if (timeoutMs < 0)
             {
                 timeoutMs = 0;
             }
-            if (pollIntervalMs <= 0)
+
+            bool progressed = PollOnce();
+            if (progressed || timeoutMs == 0)
             {
-                pollIntervalMs = 1;
+                return progressed;
             }
 
             DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
             while (DateTime.UtcNow < deadline)
             {
-                Poll();
-                if (_inboundKcpCount > beforeResume)
+                Thread.Sleep(1);
+                progressed = PollOnce();
+                if (progressed)
                 {
-                    return UkcpResumeResult.Resumed;
+                    return true;
                 }
-                Thread.Sleep(pollIntervalMs);
             }
 
-            HardRedial(authPayload);
-            return UkcpResumeResult.Redialed;
+            return false;
         }
 
-        public void Poll()
+        public bool Recv(out byte[] payload)
         {
-            if (!_connected)
+            if (_receivedMessages.Count == 0)
             {
-                return;
+                payload = Array.Empty<byte>();
+                return false;
             }
 
-            DrainSocket();
+            payload = _receivedMessages.Dequeue();
+            return true;
+        }
+
+        private bool PollOnce()
+        {
+            bool progressed = DrainSocket();
+            if (_kcp == null)
+            {
+                return progressed;
+            }
+
             _kcp.Update(NowMs());
-            DrainKcp();
+            return DrainKcp() || progressed;
         }
 
-        public void Close()
+        private bool SendKcpInternal(byte[] payload)
         {
-            if (!_connected)
+            if (!_connected || _socket == null || _kcp == null)
             {
-                return;
+                return false;
+            }
+            if (payload.Length > MaxKcpPayloadSize(_kcp))
+            {
+                return false;
             }
 
-            _connected = false;
-            _socket.Close();
-            _authStarted = false;
-            if (Closed != null) Closed();
-        }
-
-        private void SendKcpInternal(byte[] payload, UkcpHeaderFlags flags)
-        {
-            _outputFlags = flags;
-            try
+            int result = _kcp.Send(payload, 0, payload.Length);
+            if (result != 0)
             {
-                int result = _kcp.Send(payload, 0, payload.Length);
-                if (result != 0)
-                {
-                    throw new InvalidOperationException("KCP send failed.");
-                }
+                return false;
+            }
 
-                _kcp.Flush();
-                _kcp.Update(NowMs());
-            }
-            finally
-            {
-                _outputFlags = UkcpHeaderFlags.None;
-            }
+            _kcp.Flush();
+            _kcp.Update(NowMs());
+            return true;
         }
 
         private void HandleKcpOutput(byte[] buffer, int size)
         {
-            if (!_connected)
+            if (!_connected || _socket == null)
             {
                 return;
             }
 
             byte[] segment = new byte[size];
             Buffer.BlockCopy(buffer, 0, segment, 0, size);
-            var header = new UkcpHeader(UkcpMessageType.Kcp, _outputFlags, checked((ushort)size), _config.SessId, 0);
+            var header = new UkcpHeader(UkcpMessageType.Kcp, _outputFlags, checked((ushort)size), _sessId, 0);
             byte[] packet = header.Wrap(segment);
             _socket.Send(packet, packet.Length);
         }
 
-        private void DrainSocket()
+        private bool DrainSocket()
         {
+            if (_socket == null || _kcp == null)
+            {
+                return false;
+            }
+
+            bool progressed = false;
             while (_socket.TryReceive(_receiveBuffer, out int length))
             {
                 UkcpHeader header;
                 if (!UkcpHeader.TryDecode(_receiveBuffer, 0, length, out header))
                 {
-                    if (Error != null) Error("Invalid UKCP header.");
                     continue;
                 }
 
-                if (header.SessId != _config.SessId || length != UkcpHeader.Size + header.BodyLength)
+                if (header.SessId != _sessId || length != UkcpHeader.Size + header.BodyLength)
                 {
                     continue;
                 }
 
+                progressed = true;
                 if (header.MessageType == UkcpMessageType.Kcp)
                 {
-                    int result = _kcp.Input(_receiveBuffer, UkcpHeader.Size, header.BodyLength);
-                    if (result != 0 && Error != null)
+                    if (_kcp.Input(_receiveBuffer, UkcpHeader.Size, header.BodyLength) != 0)
                     {
-                        Error("KCP input failed.");
+                        continue;
                     }
                 }
                 else
                 {
                     byte[] payload = new byte[header.BodyLength];
                     Buffer.BlockCopy(_receiveBuffer, UkcpHeader.Size, payload, 0, payload.Length);
-                    if (UdpMessage != null) UdpMessage(payload);
+                    _receivedMessages.Enqueue(payload);
                 }
             }
+
+            return progressed;
         }
 
-        private void DrainKcp()
+        private bool DrainKcp()
         {
+            if (_kcp == null)
+            {
+                return false;
+            }
+
+            bool progressed = false;
             while (true)
             {
                 int size = _kcp.PeekSize();
                 if (size <= 0)
                 {
-                    return;
+                    return progressed;
                 }
 
                 byte[] payload = new byte[size];
                 int received = _kcp.Receive(payload, payload.Length);
                 if (received <= 0)
                 {
-                    return;
+                    return progressed;
                 }
 
-                _inboundKcpCount++;
-                if (KcpMessage != null) KcpMessage(payload);
+                progressed = true;
+                _receivedMessages.Enqueue(payload);
             }
         }
 
-        private void EnsureConnected()
+        private Kcp CreateKcp(uint kcpMtu)
         {
-            if (!_connected)
+            var kcp = new Kcp(_sessId, HandleKcpOutput);
+            kcp.SetNoDelay(_config.NoDelay, _config.Interval, _config.Resend, _config.NoCongestion);
+            kcp.SetWindowSize(_config.SendWindow, _config.ReceiveWindow);
+            kcp.SetMtu(kcpMtu);
+            return kcp;
+        }
+
+        private static (string Host, int Port) ParseServerAddress(string serverAddress)
+        {
+            int separator = serverAddress.LastIndexOf(':');
+            if (separator <= 0 || separator == serverAddress.Length - 1)
             {
-                throw new InvalidOperationException("Client is not connected.");
+                throw new ArgumentException("Server address must be host:port.", nameof(serverAddress));
             }
+
+            string host = serverAddress.Substring(0, separator);
+            if (!int.TryParse(serverAddress.Substring(separator + 1), out int port) || port <= 0 || port > 65535)
+            {
+                throw new ArgumentException("Server address must contain a valid port.", nameof(serverAddress));
+            }
+
+            return (host, port);
+        }
+
+        private static uint KcpMtuFromTransportMtu(uint mtu)
+        {
+            if (mtu <= UkcpHeader.Size)
+            {
+                return 0;
+            }
+            return mtu - UkcpHeader.Size;
+        }
+
+        private static int MaxKcpPayloadSize(Kcp kcp)
+        {
+            return checked((int)(kcp.mss * MaxKcpMessageFragments));
         }
 
         private static uint NowMs()
         {
             return unchecked((uint)Environment.TickCount64);
-        }
-
-        private void HardRedial(byte[] authPayload)
-        {
-            ReplaceSocket(closeCurrent: true);
-            _kcp = CreateKcp();
-            _authStarted = false;
-            _inboundKcpCount = 0;
-            SendAuth(authPayload);
-        }
-
-        private void ReplaceSocket(bool closeCurrent)
-        {
-            IDatagramSocket next = _config.CreateSocket();
-            next.Connect(_config.Host, _config.Port);
-
-            IDatagramSocket current = _socket;
-            _socket = next;
-            if (closeCurrent)
-            {
-                current.Close();
-            }
-        }
-
-        private Kcp CreateKcp()
-        {
-            var kcp = new Kcp(_config.SessId, HandleKcpOutput);
-            kcp.SetNoDelay(_config.NoDelay, _config.Interval, _config.Resend, _config.NoCongestion);
-            kcp.SetWindowSize(_config.SendWindow, _config.ReceiveWindow);
-            kcp.SetMtu(_config.Mtu);
-            return kcp;
         }
     }
 }

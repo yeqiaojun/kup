@@ -42,6 +42,7 @@ const (
 
 type clientEvent struct {
 	kind    clientEventKind
+	msgType protocol.MsgType
 	payload []byte
 	flags   protocol.Flags
 }
@@ -72,7 +73,10 @@ func Dial(addr string, sessID uint32, config Config) (*Client, error) {
 	})
 	client.kcp.NoDelay(cfg.KCP.NoDelay, cfg.KCP.Interval, cfg.KCP.Resend, cfg.KCP.NoCongestion)
 	client.kcp.WndSize(cfg.KCP.SendWindow, cfg.KCP.RecvWindow)
-	client.kcp.SetMtu(cfg.KCP.MTU)
+	kcpMTU := kcpMtuFromTransportMtu(cfg.KCP.MTU)
+	if kcpMTU >= kcpMinMtu {
+		_ = client.kcp.SetMtu(kcpMTU)
+	}
 
 	client.wg.Add(2)
 	go client.readLoop()
@@ -80,12 +84,12 @@ func Dial(addr string, sessID uint32, config Config) (*Client, error) {
 	return client, nil
 }
 
-func (c *Client) SendUDP(packetSeq uint32, payload []byte, repeat int) error {
-	if repeat <= 0 {
-		repeat = 1
-	}
+func (c *Client) SendUdp(packetSeq uint32, payload []byte) error {
 	if c.isClosed() {
 		return ErrClientClosed
+	}
+	if len(payload) > maxPacketBodyLen {
+		return ErrPayloadTooLarge
 	}
 
 	header, err := (protocol.Header{
@@ -105,15 +109,13 @@ func (c *Client) SendUDP(packetSeq uint32, payload []byte, repeat int) error {
 	if conn == nil {
 		return ErrClientClosed
 	}
-	for i := 0; i < repeat; i++ {
-		if _, err := conn.WriteTo(packet, c.serverAddr); err != nil {
-			return err
-		}
+	if _, err := conn.WriteTo(packet, c.serverAddr); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (c *Client) SendKCP(payload []byte) error {
+func (c *Client) SendKcp(payload []byte) error {
 	return c.sendKCPEvent(payload, protocol.FlagNone)
 }
 
@@ -124,6 +126,9 @@ func (c *Client) SendAuth(payload []byte) error {
 func (c *Client) sendKCPEvent(payload []byte, flags protocol.Flags) error {
 	if c.isClosed() {
 		return ErrClientClosed
+	}
+	if len(payload) > maxKcpPayloadForTransportMtu(c.config.KCP.MTU) {
+		return ErrKcpPayloadTooLarge
 	}
 
 	body := append([]byte(nil), payload...)
@@ -199,13 +204,9 @@ func (c *Client) readLoop() {
 		if err != nil || header.SessID != c.sessID {
 			continue
 		}
-		if header.MsgType != protocol.MsgTypeKCP {
-			continue
-		}
-
 		packet := append([]byte(nil), body...)
 		select {
-		case c.events <- clientEvent{kind: clientEventInbound, payload: packet}:
+		case c.events <- clientEvent{kind: clientEventInbound, msgType: header.MsgType, payload: packet}:
 		case <-c.closed:
 			return
 		}
@@ -228,11 +229,19 @@ func (c *Client) loop() {
 		case event := <-c.events:
 			switch event.kind {
 			case clientEventInbound:
+				if event.msgType == protocol.MsgTypeUDP {
+					select {
+					case c.recvCh <- event.payload:
+					case <-c.closed:
+						return
+					}
+					break
+				}
 				if rc := c.kcp.Input(event.payload, kcp.IKCP_PACKET_REGULAR, c.config.KCP.AckNoDelay); rc == 0 {
 					c.drainKCP()
 				}
 			case clientEventSendKCP:
-				c.sendKCP(event.payload, event.flags)
+				c.sendKcp(event.payload, event.flags)
 			}
 		}
 	}
@@ -260,7 +269,7 @@ func (c *Client) drainKCP() {
 	}
 }
 
-func (c *Client) sendKCP(payload []byte, flags protocol.Flags) {
+func (c *Client) sendKcp(payload []byte, flags protocol.Flags) {
 	c.outputFlags = flags
 	defer func() {
 		c.outputFlags = protocol.FlagNone

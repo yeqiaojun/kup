@@ -6,10 +6,6 @@ namespace ukcp {
 
 namespace {
 
-constexpr int kMinKcpMtu = 50;
-
-int KcpMtuFromTransportMtu(int mtu) { return mtu - static_cast<int>(Header::kSize); }
-
 std::string CloseReasonOrDefault(const std::string &reason) { return reason.empty() ? std::string("session closed") : reason; }
 
 std::vector<std::uint8_t> &WrappedPacketBuffer(std::size_t size) {
@@ -66,7 +62,7 @@ bool Session::SendKcp(std::span<const std::uint8_t> payload) {
                 std::unique_lock lock(impl_->mutex);
                 if (impl_->closed || impl_->kcp == nullptr) { return false; }
                 if (impl_->remote.valid() == false) { return false; }
-                if (payload.size() > MaxKcpPayloadSize(*impl_->kcp)) { return false; }
+                if (payload.size() > MaxKcpPayloadSizeForTransportMtu(impl_->transport_mtu)) { return false; }
 
                 if (ikcp_send(impl_->kcp, reinterpret_cast<const char *>(payload.data()), static_cast<int>(payload.size())) < 0) { return false; }
         }

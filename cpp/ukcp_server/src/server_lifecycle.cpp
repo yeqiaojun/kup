@@ -69,6 +69,7 @@ Session *ActivatePending(ServerImpl &impl, PendingAuth &&pending) {
         auto session_impl = std::make_unique<SessionImpl>();
         session_impl->server = &impl;
         session_impl->sess_id = pending.sess_id;
+        session_impl->transport_mtu = pending.transport_mtu;
         session_impl->remote = pending.remote;
         session_impl->kcp = pending.kcp;
         session_impl->recv_buffer = std::move(pending.recv_buffer);

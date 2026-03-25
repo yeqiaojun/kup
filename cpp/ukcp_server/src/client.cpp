@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "ikcp.h"
+#include "kcp_limits.hpp"
 #include "platform_socket.hpp"
 #include "ukcp/protocol.hpp"
 
@@ -29,16 +30,6 @@ struct ClientImpl {
 };
 
 namespace {
-
-constexpr int kMinKcpMtu = 50;
-constexpr std::size_t kMaxKcpMessageFragments = 127;
-
-int KcpMtuFromTransportMtu(int mtu) { return mtu - static_cast<int>(Header::kSize); }
-
-std::size_t MaxKcpPayloadSize(const ikcpcb &kcp) {
-        if (kcp.mss == 0) { return 0; }
-        return static_cast<std::size_t>(kcp.mss) * kMaxKcpMessageFragments;
-}
 
 void ConfigureKcp(ikcpcb &kcp, const Config &config) {
         ikcp_nodelay(&kcp, config.kcp.no_delay, config.kcp.interval, config.kcp.resend, config.kcp.no_congestion);
@@ -212,7 +203,7 @@ void Client::Close() {
 bool Client::IsConnected() const noexcept { return impl_ != nullptr && impl_->connected; }
 
 bool Client::SendKcp(std::span<const std::uint8_t> payload) {
-        if (!impl_ || !impl_->connected || impl_->kcp == nullptr || payload.size() > MaxKcpPayloadSize(*impl_->kcp)) { return false; }
+        if (!impl_ || !impl_->connected || impl_->kcp == nullptr || payload.size() > MaxKcpPayloadSizeForTransportMtu(impl_->config.kcp.mtu)) { return false; }
         if (ikcp_send(impl_->kcp, reinterpret_cast<const char *>(payload.data()), static_cast<int>(payload.size())) < 0) { return false; }
         return DriveKcp(*impl_, NowMs());
 }

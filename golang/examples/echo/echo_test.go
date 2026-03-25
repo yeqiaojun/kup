@@ -28,8 +28,10 @@ func TestEchoServerRepeatingUDPReturnsSingleKCPEcho(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	if err := client.SendUDP(7, []byte("udp-echo"), 3); err != nil {
-		t.Fatalf("SendUDP() error = %v", err)
+	for i := 0; i < 3; i++ {
+		if err := client.SendUdp(7, []byte("udp-echo")); err != nil {
+			t.Fatalf("SendUdp() error = %v", err)
+		}
 	}
 
 	reply := waitFor(t, client.Recv())
@@ -60,8 +62,8 @@ func TestEchoServerKCPEcho(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	if err := client.SendKCP([]byte("kcp-echo")); err != nil {
-		t.Fatalf("SendKCP() error = %v", err)
+	if err := client.SendKcp([]byte("kcp-echo")); err != nil {
+		t.Fatalf("SendKcp() error = %v", err)
 	}
 
 	reply := waitFor(t, client.Recv())

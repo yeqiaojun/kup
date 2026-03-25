@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "ikcp.h"
+#include "kcp_limits.hpp"
 #include "platform_socket.hpp"
 #include "ukcp/config.hpp"
 #include "ukcp/handler.hpp"
@@ -24,13 +25,11 @@ namespace ukcp {
 #define UKCP_ENABLE_STATS 0
 #endif
 
-// Vendored ikcp_send rejects fragmented messages with count >= IKCP_WND_RCV.
-constexpr std::size_t kMaxKcpMessageFragments = 127;
-
 struct SessionImpl {
         ServerImpl *server{nullptr};
         Session *public_session{nullptr};
         std::uint32_t sess_id{0};
+        int transport_mtu{1024};
         Endpoint remote{};
         SocketHandle socket_fd{kInvalidSocket};
         ikcpcb *kcp{nullptr};
@@ -44,6 +43,7 @@ struct SessionImpl {
 
 struct PendingAuth {
         std::uint32_t sess_id{0};
+        int transport_mtu{1024};
         Endpoint remote{};
         ikcpcb *kcp{nullptr};
         std::vector<std::uint8_t> recv_buffer;
@@ -150,11 +150,6 @@ inline void RecordSentUdpStats(ServerImpl &impl, std::size_t bytes) {
         (void)impl;
         (void)bytes;
 #endif
-}
-
-inline std::size_t MaxKcpPayloadSize(const ikcpcb &kcp) {
-        if (kcp.mss == 0) { return 0; }
-        return static_cast<std::size_t>(kcp.mss) * kMaxKcpMessageFragments;
 }
 
 } // namespace ukcp

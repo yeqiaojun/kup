@@ -31,8 +31,8 @@ func TestClientEndToEndUDPAndKCP(t *testing.T) {
 		},
 		OnKCPFunc: func(sess *Session, payload []byte) {
 			serverKCP <- append([]byte(nil), payload...)
-			if err := sess.Send([]byte("pong")); err != nil {
-				t.Errorf("sess.Send() error = %v", err)
+			if err := sess.SendKcp([]byte("pong")); err != nil {
+				t.Errorf("sess.SendKcp() error = %v", err)
 			}
 		},
 	}, Config{})
@@ -47,9 +47,7 @@ func TestClientEndToEndUDPAndKCP(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.SendUDP(10, []byte("ignored"), 2); err != nil {
-		t.Fatalf("SendUDP() pre-auth error = %v", err)
-	}
+	sendUdpRepeat(t, client, 10, []byte("ignored"), 2)
 	time.Sleep(50 * time.Millisecond)
 	if got := udpHits.Load(); got != 0 {
 		t.Fatalf("pre-auth udp hits = %d, want 0", got)
@@ -60,9 +58,7 @@ func TestClientEndToEndUDPAndKCP(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	if err := client.SendUDP(11, []byte("swing"), 3); err != nil {
-		t.Fatalf("SendUDP() error = %v", err)
-	}
+	sendUdpRepeat(t, client, 11, []byte("swing"), 3)
 
 	waitUntil(t, func() bool {
 		return udpHits.Load() == 3
@@ -72,8 +68,8 @@ func TestClientEndToEndUDPAndKCP(t *testing.T) {
 		t.Fatalf("udp hits = %d, want 3", got)
 	}
 
-	if err := client.SendKCP([]byte("ping")); err != nil {
-		t.Fatalf("SendKCP() error = %v", err)
+	if err := client.SendKcp([]byte("ping")); err != nil {
+		t.Fatalf("SendKcp() error = %v", err)
 	}
 
 	serverPayload := waitFor(t, serverKCP)
@@ -111,8 +107,8 @@ func TestServerSendAPIs(t *testing.T) {
 	client3 := mustDialAndAuth(t, serverSendTestAddr, 8103)
 	defer client3.Close()
 
-	if err := server.SendToSess(8101, []byte("one")); err != nil {
-		t.Fatalf("SendToSess() error = %v", err)
+	if !server.SendKcpToSess(8101, []byte("one")) {
+		t.Fatal("SendKcpToSess() = false, want true")
 	}
 	if got := waitFor(t, client1.Recv()); !bytes.Equal(got, []byte("one")) {
 		t.Fatalf("client1 recv = %q, want %q", got, "one")
@@ -120,9 +116,8 @@ func TestServerSendAPIs(t *testing.T) {
 	assertNoMessage(t, client2.Recv())
 	assertNoMessage(t, client3.Recv())
 
-	report := server.SendToMultiSess([]uint32{8101, 8102, 8102, 9999}, []byte("group"))
-	if report.Attempted != 3 || report.Sent != 2 || report.Failed != 1 {
-		t.Fatalf("SendToMultiSess() report = %+v, want Attempted=3 Sent=2 Failed=1", report)
+	if server.SendKcpToMultiSess([]uint32{8101, 8102, 8102, 9999}, []byte("group")) {
+		t.Fatal("SendKcpToMultiSess() = true, want false")
 	}
 	if got := waitFor(t, client1.Recv()); !bytes.Equal(got, []byte("group")) {
 		t.Fatalf("client1 recv = %q, want %q", got, "group")
@@ -132,10 +127,16 @@ func TestServerSendAPIs(t *testing.T) {
 	}
 	assertNoMessage(t, client3.Recv())
 
-	allReport := server.SendToAll([]byte("all"))
-	if allReport.Attempted != 3 || allReport.Sent != 3 || allReport.Failed != 0 {
-		t.Fatalf("SendToAll() report = %+v, want Attempted=3 Sent=3 Failed=0", allReport)
+	if !server.SendKcpToAll([]byte("all")) {
+		t.Fatal("SendKcpToAll() = false, want true")
 	}
+	if !server.SendUdpToSess(8103, 88, []byte("udp-one")) {
+		t.Fatal("SendUdpToSess() = false, want true")
+	}
+	if got := waitFor(t, client3.Recv()); !bytes.Equal(got, []byte("udp-one")) {
+		t.Fatalf("client3 udp recv = %q, want %q", got, "udp-one")
+	}
+
 	if got := waitFor(t, client1.Recv()); !bytes.Equal(got, []byte("all")) {
 		t.Fatalf("client1 recv = %q, want %q", got, "all")
 	}
@@ -209,22 +210,20 @@ func TestClientReconnectReplacesSessionAndContinuesIO(t *testing.T) {
 		t.Fatalf("OnSessionClose err = %v, want %v", gotCloseErr, ErrSessionReplaced)
 	}
 
-	if err := client2.SendKCP([]byte("ping-reconnect")); err != nil {
-		t.Fatalf("client2 SendKCP() error = %v", err)
+	if err := client2.SendKcp([]byte("ping-reconnect")); err != nil {
+		t.Fatalf("client2 SendKcp() error = %v", err)
 	}
 	if got := waitFor(t, kcpCh); !bytes.Equal(got, []byte("ping-reconnect")) {
 		t.Fatalf("server kcp payload = %q, want %q", got, "ping-reconnect")
 	}
 
-	if err := client2.SendUDP(21, []byte("step"), 3); err != nil {
-		t.Fatalf("client2 SendUDP() error = %v", err)
-	}
+	sendUdpRepeat(t, client2, 21, []byte("step"), 3)
 	waitUntil(t, func() bool {
 		return udpHits.Load() == 3
 	})
 
-	if err := server.SendToSess(sessID, []byte("after-reconnect")); err != nil {
-		t.Fatalf("SendToSess() error = %v", err)
+	if !server.SendKcpToSess(sessID, []byte("after-reconnect")) {
+		t.Fatal("SendKcpToSess() = false, want true")
 	}
 	if got := waitFor(t, client2.Recv()); !bytes.Equal(got, []byte("after-reconnect")) {
 		t.Fatalf("client2 recv = %q, want %q", got, "after-reconnect")
@@ -266,8 +265,8 @@ func TestClientFastReconnectContinuesWithoutSessionReplace(t *testing.T) {
 		OnKCPFunc: func(sess *Session, payload []byte) {
 			kcpCh <- append([]byte(nil), payload...)
 			if bytes.Equal(payload, []byte("after-fast-reconnect")) {
-				if err := sess.Send([]byte("server-after-fast-reconnect")); err != nil {
-					t.Errorf("sess.Send() error = %v", err)
+				if err := sess.SendKcp([]byte("server-after-fast-reconnect")); err != nil {
+					t.Errorf("sess.SendKcp() error = %v", err)
 				}
 			}
 		},
@@ -282,8 +281,8 @@ func TestClientFastReconnectContinuesWithoutSessionReplace(t *testing.T) {
 	client := mustDialAndAuth(t, "127.0.0.1:29004", sessID)
 	defer client.Close()
 
-	if err := client.SendKCP([]byte("before-fast-reconnect")); err != nil {
-		t.Fatalf("SendKCP(before) error = %v", err)
+	if err := client.SendKcp([]byte("before-fast-reconnect")); err != nil {
+		t.Fatalf("SendKcp(before) error = %v", err)
 	}
 	if got := waitFor(t, kcpCh); !bytes.Equal(got, []byte("before-fast-reconnect")) {
 		t.Fatalf("server kcp payload = %q, want %q", got, "before-fast-reconnect")
@@ -293,8 +292,8 @@ func TestClientFastReconnectContinuesWithoutSessionReplace(t *testing.T) {
 		t.Fatalf("Reconnect() error = %v", err)
 	}
 
-	if err := client.SendKCP([]byte("after-fast-reconnect")); err != nil {
-		t.Fatalf("SendKCP(after) error = %v", err)
+	if err := client.SendKcp([]byte("after-fast-reconnect")); err != nil {
+		t.Fatalf("SendKcp(after) error = %v", err)
 	}
 	if got := waitFor(t, kcpCh); !bytes.Equal(got, []byte("after-fast-reconnect")) {
 		t.Fatalf("server kcp payload = %q, want %q", got, "after-fast-reconnect")
@@ -303,9 +302,7 @@ func TestClientFastReconnectContinuesWithoutSessionReplace(t *testing.T) {
 		t.Fatalf("client recv = %q, want %q", got, "server-after-fast-reconnect")
 	}
 
-	if err := client.SendUDP(22, []byte("udp-after-fast-reconnect"), 3); err != nil {
-		t.Fatalf("SendUDP() error = %v", err)
-	}
+	sendUdpRepeat(t, client, 22, []byte("udp-after-fast-reconnect"), 3)
 	waitUntil(t, func() bool {
 		return udpHits.Load() == 3
 	})
@@ -316,6 +313,43 @@ func TestClientFastReconnectContinuesWithoutSessionReplace(t *testing.T) {
 	mu.Unlock()
 	if gotOpenCount != 1 || gotCloseCount != 0 {
 		t.Fatalf("session lifecycle open=%d close=%d, want open=1 close=0", gotOpenCount, gotCloseCount)
+	}
+}
+
+func TestClientRejectsPayloadAboveConfiguredMtuLimit(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:29005")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer conn.Close()
+
+	cfg := Config{}
+	cfg.KCP.MTU = 1024
+
+	server, err := Serve(conn, HandlerFuncs{
+		AuthFunc: func(sessID uint32, addr net.Addr, payload []byte) bool {
+			return bytes.Equal(payload, []byte("auth"))
+		},
+	}, cfg)
+	if err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	defer server.Close()
+
+	client, err := Dial("127.0.0.1:29005", 8203, cfg)
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	if err := client.SendAuth([]byte("auth")); err != nil {
+		t.Fatalf("SendAuth() error = %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	payload := bytes.Repeat([]byte("x"), maxKcpPayloadForTransportMtu(cfg.KCP.MTU)+1)
+	if err := client.SendKcp(payload); !errors.Is(err, ErrKcpPayloadTooLarge) {
+		t.Fatalf("SendKcp() error = %v, want %v", err, ErrKcpPayloadTooLarge)
 	}
 }
 
@@ -354,5 +388,15 @@ func assertNoMessage[T any](t *testing.T, ch <-chan T) {
 	case got := <-ch:
 		t.Fatalf("unexpected message: %+v", got)
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func sendUdpRepeat(t *testing.T, client *Client, packetSeq uint32, payload []byte, repeat int) {
+	t.Helper()
+
+	for i := 0; i < repeat; i++ {
+		if err := client.SendUdp(packetSeq, payload); err != nil {
+			t.Fatalf("SendUdp() error = %v", err)
+		}
 	}
 }

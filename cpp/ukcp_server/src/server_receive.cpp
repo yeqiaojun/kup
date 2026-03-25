@@ -23,6 +23,7 @@ PendingAuth &GetOrCreatePending(ServerImpl &impl, std::uint32_t sess_id, const E
 
         PendingAuth pending{};
         pending.sess_id = sess_id;
+        pending.transport_mtu = impl.config.kcp.mtu;
         pending.remote = endpoint;
         pending.kcp = ikcp_create(sess_id, nullptr);
         pending.kcp->user = &pending;

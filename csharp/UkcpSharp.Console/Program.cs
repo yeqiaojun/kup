@@ -4,30 +4,12 @@ using UkcpSharp;
 var options = ParseArgs(args);
 using var tracker = new RunTracker(options.Count);
 
-var client = new UkcpClient(new UkcpClientConfig
+var client = new UkcpClient(options.Host + ":" + options.Port, options.SessId, new UkcpClientConfig());
+if (!client.Connect(Encoding.UTF8.GetBytes("auth")))
 {
-    Host = options.Host,
-    Port = options.Port,
-    SessId = options.SessId
-});
-
-client.KcpMessage += payload =>
-{
-    string text = Encoding.UTF8.GetString(payload);
-    Console.WriteLine("recv " + text);
-    tracker.OnReceive(text);
-};
-client.Error += message =>
-{
-    Console.Error.WriteLine("error " + message);
-    tracker.OnError(message);
-};
-client.Closed += () =>
-{
-    Console.WriteLine("closed");
-};
-
-client.ConnectAndAuth(Encoding.UTF8.GetBytes("auth"));
+    Console.Error.WriteLine("connect failed");
+    return 1;
+}
 
 Warmup(client, options.AuthWaitMs);
 
@@ -36,23 +18,39 @@ for (int i = 1; i <= options.Count; i++)
     string text = i.ToString();
     byte[] payload = Encoding.UTF8.GetBytes(text);
     Console.WriteLine("send kcp " + text);
-    client.SendKcp(payload);
+    if (!client.SendKcp(payload))
+    {
+        tracker.MarkFailed();
+        break;
+    }
     tracker.OnSentKcp();
     client.Poll();
+    DrainReceived(client, tracker);
     Thread.Sleep(100);
     client.Poll();
+    DrainReceived(client, tracker);
     Console.WriteLine("send udp " + text + " x3");
-    client.SendUdp((uint)i, payload, 3);
-    tracker.OnSentUdp(3);
+    for (int repeat = 0; repeat < 3; repeat++)
+    {
+        if (!client.SendUdp((uint)i, payload))
+        {
+            tracker.MarkFailed();
+            break;
+        }
+        tracker.OnSentUdp(1);
+    }
     client.Poll();
+    DrainReceived(client, tracker);
     Thread.Sleep(100);
     client.Poll();
+    DrainReceived(client, tracker);
 }
 
 var deadline = DateTime.UtcNow.AddMilliseconds(options.TimeoutMs);
 while (DateTime.UtcNow < deadline && !tracker.IsComplete)
 {
-    client.Poll();
+    client.Poll(5);
+    DrainReceived(client, tracker);
     Thread.Sleep(5);
 }
 
@@ -71,8 +69,18 @@ static void Warmup(UkcpClient client, int waitMs)
     var deadline = DateTime.UtcNow.AddMilliseconds(waitMs);
     while (DateTime.UtcNow < deadline)
     {
-        client.Poll();
+        client.Poll(5);
         Thread.Sleep(5);
+    }
+}
+
+static void DrainReceived(UkcpClient client, RunTracker tracker)
+{
+    while (client.Recv(out byte[] payload))
+    {
+        string text = Encoding.UTF8.GetString(payload);
+        Console.WriteLine("recv " + text);
+        tracker.OnReceive(text);
     }
 }
 
@@ -158,6 +166,11 @@ internal sealed class RunTracker : IDisposable
     }
 
     public void OnError(string message)
+    {
+        HasErrors = true;
+    }
+
+    public void MarkFailed()
     {
         HasErrors = true;
     }

@@ -12,13 +12,6 @@ import (
 )
 
 var ErrServerClosed = errors.New("ukcp: server closed")
-var ErrSessionNotFound = errors.New("ukcp: session not found")
-
-type SendReport struct {
-	Attempted int
-	Sent      int
-	Failed    int
-}
 
 type Server struct {
 	conn    net.PacketConn
@@ -41,6 +34,7 @@ type pendingAuth struct {
 	transport *sessionTransport
 	kcp       *kcp.KCP
 	recvBuf   []byte
+	mtu       int
 }
 
 func Listen(addr string, handler Handler, config Config) (*Server, error) {
@@ -59,15 +53,15 @@ func Serve(conn net.PacketConn, handler Handler, config Config) (*Server, error)
 		handler = HandlerFuncs{}
 	}
 
+	cfg := config.withDefaults()
 	server := &Server{
 		conn:     conn,
 		handler:  handler,
-		config:   config.withDefaults(),
+		config:   cfg,
 		closed:   make(chan struct{}),
 		sessions: make(map[uint32]*Session),
 		pending:  make(map[uint32]*pendingAuth),
 	}
-
 	server.wg.Add(1)
 	go server.readLoop()
 	return server, nil
@@ -83,72 +77,69 @@ func (s *Server) Close() error {
 	return err
 }
 
-func (s *Server) Session(sessID uint32) *Session {
+func (s *Server) FindSession(sessID uint32) *Session {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.sessions[sessID]
 }
 
-func (s *Server) SendToSess(sessID uint32, payload []byte) error {
-	sess := s.Session(sessID)
+func (s *Server) CloseSession(sessID uint32, reason string) bool {
+	s.mu.Lock()
+	sess := s.sessions[sessID]
 	if sess == nil {
-		return ErrSessionNotFound
+		s.mu.Unlock()
+		return false
 	}
-	return sess.Send(payload)
+	delete(s.sessions, sessID)
+	s.mu.Unlock()
+
+	_ = sess.closeWithReason(closeReasonError(reason, ErrSessionClosed))
+	return true
 }
 
-func (s *Server) SendToMultiSess(sessIDs []uint32, payload []byte) SendReport {
-	report := SendReport{}
-	if len(sessIDs) <= 8 {
-		for i, sessID := range sessIDs {
-			duplicate := false
-			for j := 0; j < i; j++ {
-				if sessIDs[j] == sessID {
-					duplicate = true
-					break
-				}
-			}
-			if duplicate {
-				continue
-			}
-			report.Attempted++
-			if err := s.SendToSess(sessID, payload); err != nil {
-				report.Failed++
-				continue
-			}
-			report.Sent++
-		}
-		return report
+func (s *Server) SetMtu(mtu int) bool {
+	if kcpMtuFromTransportMtu(mtu) < kcpMinMtu {
+		return false
 	}
 
-	seen := make(map[uint32]struct{}, len(sessIDs))
-	for _, sessID := range sessIDs {
-		if _, exists := seen[sessID]; exists {
-			continue
-		}
-		seen[sessID] = struct{}{}
-		report.Attempted++
-		if err := s.SendToSess(sessID, payload); err != nil {
-			report.Failed++
-			continue
-		}
-		report.Sent++
-	}
-	return report
+	s.mu.Lock()
+	s.config.KCP.MTU = mtu
+	s.mu.Unlock()
+	return true
 }
 
-func (s *Server) SendToAll(payload []byte) SendReport {
-	s.mu.RLock()
-	report := SendReport{Attempted: len(s.sessions)}
-	for _, sess := range s.sessions {
-		if err := sess.Send(payload); err != nil {
-			report.Failed++
-			continue
-		}
-		report.Sent++
-	}
-	s.mu.RUnlock()
-	return report
+func (s *Server) SendKcpToSess(sessID uint32, payload []byte) bool {
+	sess := s.FindSession(sessID)
+	return sess != nil && sess.SendKcp(payload) == nil
+}
+
+func (s *Server) SendKcpToMultiSess(sessIDs []uint32, payload []byte) bool {
+	return s.sendToSessionIDs(sessIDs, func(sess *Session) bool {
+		return sess.SendKcp(payload) == nil
+	})
+}
+
+func (s *Server) SendKcpToAll(payload []byte) bool {
+	return s.sendToSessions(s.snapshotSessions(), func(sess *Session) bool {
+		return sess.SendKcp(payload) == nil
+	})
+}
+
+func (s *Server) SendUdpToSess(sessID uint32, packetSeq uint32, payload []byte) bool {
+	sess := s.FindSession(sessID)
+	return sess != nil && sess.SendUdp(packetSeq, payload) == nil
+}
+
+func (s *Server) SendUdpToMultiSess(sessIDs []uint32, packetSeq uint32, payload []byte) bool {
+	return s.sendToSessionIDs(sessIDs, func(sess *Session) bool {
+		return sess.SendUdp(packetSeq, payload) == nil
+	})
+}
+
+func (s *Server) SendUdpToAll(packetSeq uint32, payload []byte) bool {
+	return s.sendToSessions(s.snapshotSessions(), func(sess *Session) bool {
+		return sess.SendUdp(packetSeq, payload) == nil
+	})
 }
 
 func (s *Server) readLoop() {
@@ -170,7 +161,7 @@ func (s *Server) readLoop() {
 		}
 
 		now := time.Now()
-		if sess := s.Session(header.SessID); sess != nil {
+		if sess := s.FindSession(header.SessID); sess != nil {
 			if !sameAddr(sess.RemoteAddr(), addr) {
 				if header.MsgType == protocol.MsgTypeKCP && header.Flags&protocol.FlagConnect != 0 {
 					s.handlePendingKCP(header.SessID, body, addr)
@@ -262,11 +253,13 @@ func (s *Server) getOrCreatePending(sessID uint32, addr net.Addr) *pendingAuth {
 		}
 	}
 
+	mtu := s.config.KCP.MTU
 	transport := newSessionTransport(s, sessID, addr)
 	pending := &pendingAuth{
 		sessID:    sessID,
 		transport: transport,
-		kcp:       newKCPState(s, sessID, transport),
+		kcp:       newKCPState(s.config, sessID, transport, mtu),
+		mtu:       mtu,
 	}
 	s.pending[sessID] = pending
 	return pending
@@ -284,7 +277,7 @@ func (s *Server) activatePending(pending *pendingAuth) *Session {
 	s.mu.Lock()
 	delete(s.pending, pending.sessID)
 	old := s.sessions[pending.sessID]
-	sess := newSession(s, pending.sessID, pending.transport, pending.kcp)
+	sess := newSession(s, pending.sessID, pending.transport, pending.kcp, pending.mtu)
 	s.sessions[pending.sessID] = sess
 	s.mu.Unlock()
 
@@ -293,6 +286,61 @@ func (s *Server) activatePending(pending *pendingAuth) *Session {
 	}
 	s.handler.OnSessionOpen(sess)
 	return sess
+}
+
+func (s *Server) sendToSessionIDs(sessIDs []uint32, send func(*Session) bool) bool {
+	allSent := true
+	if len(sessIDs) <= 32 {
+		unique := make([]uint32, 0, len(sessIDs))
+		for _, sessID := range sessIDs {
+			duplicate := false
+			for _, seen := range unique {
+				if seen == sessID {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+			unique = append(unique, sessID)
+			sess := s.FindSession(sessID)
+			sent := sess != nil && send(sess)
+			allSent = allSent && sent
+		}
+		return allSent
+	}
+
+	seen := make(map[uint32]struct{}, len(sessIDs))
+	for _, sessID := range sessIDs {
+		if _, exists := seen[sessID]; exists {
+			continue
+		}
+		seen[sessID] = struct{}{}
+		sess := s.FindSession(sessID)
+		sent := sess != nil && send(sess)
+		allSent = allSent && sent
+	}
+	return allSent
+}
+
+func (s *Server) snapshotSessions() []*Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sessions := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	return sessions
+}
+
+func (s *Server) sendToSessions(sessions []*Session, send func(*Session) bool) bool {
+	allSent := true
+	for _, sess := range sessions {
+		allSent = allSent && send(sess)
+	}
+	return allSent
 }
 
 func sameAddr(a, b net.Addr) bool {

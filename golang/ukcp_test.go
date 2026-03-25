@@ -2,6 +2,7 @@ package ukcp
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -50,7 +51,7 @@ func TestServerRoutesUDPWithoutDeduplication(t *testing.T) {
 			SessID:  sessID,
 		}, seg), addr)
 	}
-	waitUntil(t, func() bool { return server.Session(sessID) != nil })
+	waitUntil(t, func() bool { return server.FindSession(sessID) != nil })
 
 	packet := mustPacket(t, protocol.Header{
 		MsgType:   protocol.MsgTypeUDP,
@@ -101,7 +102,7 @@ func TestServerRoutesKCPUplink(t *testing.T) {
 			SessID:  sessID,
 		}, seg), addr)
 	}
-	waitUntil(t, func() bool { return server.Session(sessID) != nil })
+	waitUntil(t, func() bool { return server.FindSession(sessID) != nil })
 	for _, seg := range client.send(t, []byte("hello over kcp")) {
 		conn.inject(mustPacket(t, protocol.Header{
 			MsgType: protocol.MsgTypeKCP,
@@ -141,11 +142,11 @@ func TestSessionSendUsesKCPDownlink(t *testing.T) {
 			SessID:  sessID,
 		}, seg), addr)
 	}
-	waitUntil(t, func() bool { return server.Session(sessID) != nil })
+	waitUntil(t, func() bool { return server.FindSession(sessID) != nil })
 
 	sess := waitFor(t, sessionCh)
-	if err := sess.Send([]byte("server push")); err != nil {
-		t.Fatalf("Session.Send() error = %v", err)
+	if err := sess.SendKcp([]byte("server push")); err != nil {
+		t.Fatalf("Session.SendKcp() error = %v", err)
 	}
 
 	client := newTestKCP(t, sessID, nil)
@@ -228,7 +229,7 @@ func TestServerRejectsUnknownUDPAndAuthFailure(t *testing.T) {
 		t.Fatal("unexpected udp delivery for unauthenticated session")
 	case <-time.After(150 * time.Millisecond):
 	}
-	if server.Session(sessID) != nil {
+	if server.FindSession(sessID) != nil {
 		t.Fatal("expected no active session after auth failure")
 	}
 }
@@ -260,9 +261,9 @@ func TestServerAllowsKCPReauthTakeoverForSameSessID(t *testing.T) {
 			SessID:  sessID,
 		}, seg), addr1)
 	}
-	waitUntil(t, func() bool { return server.Session(sessID) != nil })
-	if err := server.SendToSess(sessID, []byte("first-downlink")); err != nil {
-		t.Fatalf("SendToSess(first) error = %v", err)
+	waitUntil(t, func() bool { return server.FindSession(sessID) != nil })
+	if !server.SendKcpToSess(sessID, []byte("first-downlink")) {
+		t.Fatal("SendKcpToSess(first) = false, want true")
 	}
 	time.Sleep(30 * time.Millisecond)
 
@@ -278,12 +279,12 @@ func TestServerAllowsKCPReauthTakeoverForSameSessID(t *testing.T) {
 	}
 
 	waitUntil(t, func() bool {
-		sess := server.Session(sessID)
+		sess := server.FindSession(sessID)
 		return sess != nil && sess.RemoteAddr() != nil && sess.RemoteAddr().String() == addr2.String()
 	})
 
-	if err := server.SendToSess(sessID, []byte("server-after-reauth")); err != nil {
-		t.Fatalf("SendToSess() error = %v", err)
+	if !server.SendKcpToSess(sessID, []byte("server-after-reauth")) {
+		t.Fatal("SendKcpToSess() = false, want true")
 	}
 
 	deadline := time.After(2 * time.Second)
@@ -318,6 +319,140 @@ func TestServerAllowsKCPReauthTakeoverForSameSessID(t *testing.T) {
 		case <-deadline:
 			t.Fatal("timed out waiting for reauth downlink")
 		}
+	}
+}
+
+func TestServerDefaultMtuRejectsPayloadAbove1024TransportLimit(t *testing.T) {
+	conn := newFakePacketConn()
+	defer conn.Close()
+
+	const sessID uint32 = 6001
+	server, err := Serve(conn, HandlerFuncs{
+		AuthFunc: func(gotSessID uint32, addr net.Addr, payload []byte) bool {
+			return gotSessID == sessID && bytes.Equal(payload, []byte("auth"))
+		},
+	}, Config{})
+	if err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	defer server.Close()
+
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 16001}
+	authClient := newTestKCP(t, sessID, nil)
+	for _, seg := range authClient.send(t, []byte("auth")) {
+		conn.inject(mustPacket(t, protocol.Header{
+			MsgType: protocol.MsgTypeKCP,
+			Flags:   protocol.FlagConnect,
+			BodyLen: uint16(len(seg)),
+			SessID:  sessID,
+		}, seg), addr)
+	}
+	waitUntil(t, func() bool { return server.FindSession(sessID) != nil })
+
+	payload := bytes.Repeat([]byte("x"), maxKcpPayloadForTransportMtu(1024)+1)
+	err = server.FindSession(sessID).SendKcp(payload)
+	if !errors.Is(err, ErrKcpPayloadTooLarge) {
+		t.Fatalf("SendKcp() error = %v, want %v", err, ErrKcpPayloadTooLarge)
+	}
+}
+
+func TestServerSetMtuAppliesToFutureSessionsOnly(t *testing.T) {
+	conn := newFakePacketConn()
+	defer conn.Close()
+
+	server, err := Serve(conn, HandlerFuncs{
+		AuthFunc: func(gotSessID uint32, addr net.Addr, payload []byte) bool {
+			return bytes.Equal(payload, []byte("auth"))
+		},
+	}, Config{
+		KCP: KCPConfig{MTU: 1300},
+	})
+	if err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	defer server.Close()
+
+	authSession := func(sessID uint32, port int) {
+		t.Helper()
+		addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
+		authClient := newTestKCP(t, sessID, nil)
+		for _, seg := range authClient.send(t, []byte("auth")) {
+			conn.inject(mustPacket(t, protocol.Header{
+				MsgType: protocol.MsgTypeKCP,
+				Flags:   protocol.FlagConnect,
+				BodyLen: uint16(len(seg)),
+				SessID:  sessID,
+			}, seg), addr)
+		}
+		waitUntil(t, func() bool { return server.FindSession(sessID) != nil })
+	}
+
+	authSession(6002, 16002)
+	if !server.SetMtu(1500) {
+		t.Fatal("SetMtu(1500) = false, want true")
+	}
+	authSession(6003, 16003)
+
+	payload := bytes.Repeat([]byte("y"), maxKcpPayloadForTransportMtu(1300)+1)
+	if len(payload) > maxKcpPayloadForTransportMtu(1500) {
+		t.Fatal("test payload exceeds new mtu limit")
+	}
+
+	if err := server.FindSession(6002).SendKcp(payload); !errors.Is(err, ErrKcpPayloadTooLarge) {
+		t.Fatalf("old session SendKcp() error = %v, want %v", err, ErrKcpPayloadTooLarge)
+	}
+	if err := server.FindSession(6003).SendKcp(payload); err != nil {
+		t.Fatalf("new session SendKcp() error = %v, want nil", err)
+	}
+}
+
+func TestServerCloseSessionRemovesItImmediately(t *testing.T) {
+	conn := newFakePacketConn()
+	defer conn.Close()
+
+	closeCh := make(chan error, 1)
+	const sessID uint32 = 6004
+	server, err := Serve(conn, HandlerFuncs{
+		AuthFunc: func(gotSessID uint32, addr net.Addr, payload []byte) bool {
+			return gotSessID == sessID && bytes.Equal(payload, []byte("auth"))
+		},
+		OnSessionCloseFunc: func(sess *Session, err error) {
+			closeCh <- err
+		},
+	}, Config{})
+	if err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	defer server.Close()
+
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 16004}
+	authClient := newTestKCP(t, sessID, nil)
+	for _, seg := range authClient.send(t, []byte("auth")) {
+		conn.inject(mustPacket(t, protocol.Header{
+			MsgType: protocol.MsgTypeKCP,
+			Flags:   protocol.FlagConnect,
+			BodyLen: uint16(len(seg)),
+			SessID:  sessID,
+		}, seg), addr)
+	}
+	waitUntil(t, func() bool { return server.FindSession(sessID) != nil })
+
+	if !server.CloseSession(sessID, "server kick") {
+		t.Fatal("CloseSession() = false, want true")
+	}
+	if server.FindSession(sessID) != nil {
+		t.Fatal("FindSession() != nil after CloseSession")
+	}
+	if server.CloseSession(sessID, "missing") {
+		t.Fatal("CloseSession(missing) = true, want false")
+	}
+	if server.SendKcpToSess(sessID, []byte("after-close")) {
+		t.Fatal("SendKcpToSess() = true after CloseSession, want false")
+	}
+
+	closeErr := waitFor(t, closeCh)
+	if closeErr == nil || closeErr.Error() != "server kick" {
+		t.Fatalf("OnSessionClose err = %v, want server kick", closeErr)
 	}
 }
 

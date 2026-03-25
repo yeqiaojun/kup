@@ -4,11 +4,8 @@ namespace UkcpSharp
 {
     public sealed class UkcpClientConfig
     {
-        public string Host { get; set; } = "127.0.0.1";
-        public int Port { get; set; } = 9000;
-        public uint SessId { get; set; }
-        public int PacketBufferSize { get; set; } = 2048;
-        public uint Mtu { get; set; } = 1200;
+        public int ReceiveBufferSize { get; set; } = 2048;
+        public uint Mtu { get; set; } = 1024;
         public uint NoDelay { get; set; } = 1;
         public uint Interval { get; set; } = 10;
         public int Resend { get; set; } = 2;

@@ -42,7 +42,7 @@ func BenchmarkServerKCPUplink(b *testing.B) {
 			SessID:  sessID,
 		}, seg), addr)
 	}
-	waitUntilBench(b, func() bool { return server.Session(sessID) != nil })
+	waitUntilBench(b, func() bool { return server.FindSession(sessID) != nil })
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -107,14 +107,14 @@ func BenchmarkServerSessionSend(b *testing.B) {
 			SessID:  sessID,
 		}, seg), addr)
 	}
-	waitUntilBench(b, func() bool { return server.Session(sessID) != nil })
+	waitUntilBench(b, func() bool { return server.FindSession(sessID) != nil })
 
 	payload := []byte("server-push")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := server.SendToSess(sessID, payload); err != nil {
-			b.Fatalf("SendToSess() error = %v", err)
+		if !server.SendKcpToSess(sessID, payload) {
+			b.Fatal("SendKcpToSess() = false, want true")
 		}
 		<-conn.writeCh
 	}
