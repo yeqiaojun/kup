@@ -40,7 +40,7 @@ bool Header::EncodeTo(std::span<std::uint8_t> dst) const noexcept {
 
 std::array<std::uint8_t, Header::kSize> Header::Encode() const noexcept {
         std::array<std::uint8_t, kSize> out{};
-        (void)EncodeTo(out);
+        [[maybe_unused]] const bool encoded = EncodeTo(out);
         return out;
 }
 
